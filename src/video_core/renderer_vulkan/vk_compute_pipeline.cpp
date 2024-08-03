@@ -149,6 +149,9 @@ bool ComputePipeline::BindResources(Core::MemoryManager* memory, StreamBuffer& s
     }
     for (const auto& sampler : info.samplers) {
         const auto ssharp = sampler.GetSsharp(info);
+        if (ssharp.force_degamma) {
+            LOG_WARNING(Render_Vulkan, "Texture requires gamma correction");
+        }
         const auto vk_sampler = texture_cache.GetSampler(ssharp);
         image_infos.emplace_back(vk_sampler, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
         set_writes.push_back({

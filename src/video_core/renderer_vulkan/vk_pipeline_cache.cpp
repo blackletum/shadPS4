@@ -188,6 +188,11 @@ void PipelineCache::RefreshGraphicsKey() {
         if (skip_cb_binding || !col_buf || !regs.color_target_mask.GetMask(cb)) {
             continue;
         }
+
+        if (regs.color_control.degamma_enable) {
+            LOG_WARNING(Render_Vulkan, "Color buffer {} requires gamma correction", cb);
+        }
+
         const auto base_format =
             LiverpoolToVK::SurfaceFormat(col_buf.info.format, col_buf.NumFormat());
         const auto is_vo_surface = renderer->IsVideoOutSurface(col_buf);
