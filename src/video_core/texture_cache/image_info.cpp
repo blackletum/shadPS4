@@ -284,4 +284,18 @@ void ImageInfo::UpdateSize() {
     guest_size_bytes *= resources.layers;
 }
 
+bool ImageInfo::IsMipOf(const ImageInfo& info) const {
+    const bool is_2d_dims_match =
+        (size.width == info.size.width / 2) && (size.height == info.size.height / 2);
+
+    return is_2d_dims_match && false;
+}
+
+bool ImageInfo::IsSliceOf(const ImageInfo& info) const {
+    const bool is_2d_dims_match =
+        (size.width == info.size.width) && (size.height == info.size.height);
+
+    return is_2d_dims_match && false;
+}
+
 } // namespace VideoCore

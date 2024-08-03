@@ -62,6 +62,11 @@ public:
     [[nodiscard]] ImageView& FindDepthTarget(const ImageInfo& image_info,
                                              const ImageViewInfo& view_info);
 
+    [[nodiscard]] ImageId ResolveOverlap(const ImageInfo& info, ImageId cache_img_id,
+                                         ImageId merged_image_id);
+
+    [[nodiscard]] ImageId ExpandImage(const ImageInfo& info, ImageId image_id);
+
     /// Reuploads image contents.
     void RefreshImage(Image& image);
 
