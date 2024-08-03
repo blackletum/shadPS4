@@ -33,8 +33,9 @@ public:
 
     void DispatchDirect();
 
-    void ScopeMarkerBegin(const std::string& str);
+    void ScopeMarkerBegin(const std::string_view& str);
     void ScopeMarkerEnd();
+    void ScopedMarkerInsert(const std::string_view& str);
 
     u64 Flush();
 

@@ -26,6 +26,7 @@ static u32 vblankDivider = 1;
 static bool vkValidation = false;
 static bool vkValidationSync = false;
 static bool rdocEnable = false;
+static bool rdocMarkersEnable = false;
 // Gui
 std::string settings_install_dir = "";
 u32 main_window_geometry_x = 400;
@@ -98,6 +99,10 @@ bool dumpPM4() {
 
 bool isRdocEnabled() {
     return rdocEnable;
+}
+
+bool isMarkersEnabled() {
+    return rdocMarkersEnable;
 }
 
 u32 vblankDiv() {
@@ -258,6 +263,7 @@ void load(const std::filesystem::path& path) {
             vkValidation = toml::find_or<toml::boolean>(vk, "validation", true);
             vkValidationSync = toml::find_or<toml::boolean>(vk, "validation_sync", true);
             rdocEnable = toml::find_or<toml::boolean>(vk, "rdocEnable", false);
+            rdocMarkersEnable = toml::find_or<toml::boolean>(vk, "rdocMarkersEnable", false);
         }
     }
     if (data.contains("Debug")) {
@@ -334,6 +340,7 @@ void save(const std::filesystem::path& path) {
     data["Vulkan"]["validation"] = vkValidation;
     data["Vulkan"]["validation_sync"] = vkValidationSync;
     data["Vulkan"]["rdocEnable"] = rdocEnable;
+    data["Vulkan"]["rdocMarkersEnable"] = rdocMarkersEnable;
     data["Debug"]["DebugDump"] = isDebugDump;
     data["LLE"]["libc"] = isLibc;
     data["GUI"]["theme"] = mw_themes;
