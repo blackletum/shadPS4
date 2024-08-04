@@ -48,7 +48,7 @@ public:
     void OnCpuWrite(VAddr address);
 
     /// Retrieves the image handle of the image with the provided attributes.
-    [[nodiscard]] ImageId FindImage(const ImageInfo& info, bool refresh_on_create = true);
+    [[nodiscard]] ImageId FindImage(const ImageInfo& info, bool skip_refresh = false);
 
     /// Retrieves an image view with the properties of the specified image descriptor.
     [[nodiscard]] ImageView& FindTexture(const ImageInfo& image_info,
@@ -67,8 +67,20 @@ public:
 
     [[nodiscard]] ImageId ExpandImage(const ImageInfo& info, ImageId image_id);
 
+    /// Updates image contents if it was modified by CPU.
+    void UpdateImage(ImageId image_id, Vulkan::Scheduler* custom_scheduler = nullptr) {
+        Image& image = slot_images[image_id];
+
+        if (False(image.flags & ImageFlagBits::CpuModified)) {
+            return;
+        }
+
+        RefreshImage(image, custom_scheduler);
+        TrackImage(image, image_id);
+    }
+
     /// Reuploads image contents.
-    void RefreshImage(Image& image);
+    void RefreshImage(Image& image, Vulkan::Scheduler* custom_scheduler = nullptr);
 
     /// Retrieves the sampler that matches the provided S# descriptor.
     [[nodiscard]] vk::Sampler GetSampler(const AmdGpu::Sampler& sampler);

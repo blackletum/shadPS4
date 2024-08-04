@@ -204,7 +204,7 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
                                 bool is_eop /*= false*/) {
     Vulkan::Frame* frame;
     if (index == -1) {
-        frame = renderer->PrepareBlankFrame();
+        frame = renderer->PrepareBlankFrame(is_eop);
     } else {
         const auto& buffer = port->buffer_slots[index];
         const auto& group = port->groups[buffer.group_index];

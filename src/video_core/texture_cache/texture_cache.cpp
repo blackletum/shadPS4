@@ -153,7 +153,7 @@ ImageId TextureCache::ResolveOverlap(const ImageInfo& image_info, ImageId cache_
         return new_image_id;
     }
 
-    // Right overlap, the image requested is a possible subresource of the image from cache.
+    // Right overlap, the requested image is a possible subresource of the image from cache.
     // Should be handled by view. No additional actions needed, just sanity check.
     if (image_info.guest_address > tex_cache_image.info.guest_address) {
         if (image_info.IsSliceOf(tex_cache_image.info)) {
@@ -203,7 +203,7 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
     return new_image_id;
 }
 
-ImageId TextureCache::FindImage(const ImageInfo& info, bool refresh_on_create) {
+ImageId TextureCache::FindImage(const ImageInfo& info, bool skip_refresh) {
     std::unique_lock lock{m_page_table};
     boost::container::small_vector<ImageId, 8> image_ids;
     ForEachImageInRegion(
@@ -257,10 +257,8 @@ ImageId TextureCache::FindImage(const ImageInfo& info, bool refresh_on_create) {
         RegisterImage(image_id);
     }
 
-    Image& image = slot_images[image_id];
-    if (True(image.flags & ImageFlagBits::CpuModified) && refresh_on_create) {
-        RefreshImage(image);
-        TrackImage(image, image_id);
+    if (!skip_refresh) {
+        UpdateImage(image_id);
     }
 
     return image_id;
@@ -348,7 +346,7 @@ ImageView& TextureCache::FindRenderTarget(const ImageInfo& image_info,
 
 ImageView& TextureCache::FindDepthTarget(const ImageInfo& image_info,
                                          const ImageViewInfo& view_info) {
-    const ImageId image_id = FindImage(image_info, false);
+    const ImageId image_id = FindImage(image_info, true);
     Image& image = slot_images[image_id];
     image.flags &= ~ImageFlagBits::CpuModified;
 
@@ -374,13 +372,14 @@ ImageView& TextureCache::FindDepthTarget(const ImageInfo& image_info,
     return RegisterImageView(image_id, view_info);
 }
 
-void TextureCache::RefreshImage(Image& image) {
+void TextureCache::RefreshImage(Image& image, Vulkan::Scheduler* custom_scheduler /*= nullptr*/) {
     // Mark image as validated.
     image.flags &= ~ImageFlagBits::CpuModified;
 
-    scheduler.EndRendering();
+    auto* sched_ptr = custom_scheduler ? custom_scheduler : &scheduler;
+    sched_ptr->EndRendering();
 
-    const auto cmdbuf = scheduler.CommandBuffer();
+    const auto cmdbuf = sched_ptr->CommandBuffer();
     image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits::eTransferWrite);
 
     vk::Buffer buffer{staging.Handle()};
