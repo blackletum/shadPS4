@@ -263,6 +263,7 @@ find_package(xxHash 0.8.2 MODULE)
 find_package(ZLIB 1.3 MODULE)
 find_package(Zydis 5.0.0 MODULE)
 find_package(pugixml 1.14 CONFIG)
+find_package(CryptoPP MODULE REQUIRED)
 if (APPLE)
     find_package(date 3.0.1 CONFIG)
     find_package(epoll-shim 3.14 CONFIG)
@@ -889,6 +890,13 @@ set(CORE src/core/aerolib/stubs.cpp
          src/core/file_format/trp.h
          src/core/file_format/npbind.cpp
          src/core/file_format/npbind.h
+         src/core/file_format/pkg.cpp
+         src/core/file_format/pkg.h
+         src/core/file_format/pkg_type.cpp
+         src/core/file_format/pkg_type.h
+         src/core/crypto/crypto.cpp
+         src/core/crypto/crypto.h
+         src/core/crypto/keys.h
          src/core/file_sys/fs.cpp
          src/core/file_sys/fs.h
          src/core/ipc/ipc.cpp
@@ -1343,7 +1351,7 @@ endif()
 
 create_target_directory_groups(shadps4)
 
-target_link_libraries(shadps4 PRIVATE magic_enum::magic_enum fmt::fmt toml11::toml11 tsl::robin_map xbyak::xbyak Tracy::TracyClient RenderDoc::API FFmpeg::ffmpeg Dear_ImGui ImGuiFileDialog gcn half::half ZLIB::ZLIB PNG::PNG minimp3)
+target_link_libraries(shadps4 PRIVATE magic_enum::magic_enum fmt::fmt toml11::toml11 tsl::robin_map xbyak::xbyak Tracy::TracyClient RenderDoc::API FFmpeg::ffmpeg Dear_ImGui ImGuiFileDialog gcn half::half ZLIB::ZLIB PNG::PNG minimp3 cryptopp::cryptopp)
 target_link_libraries(shadps4 PRIVATE Boost::headers GPUOpen::VulkanMemoryAllocator LibAtrac9 sirit Vulkan::Headers xxHash::xxhash Zydis::Zydis glslang::glslang SDL3::SDL3 SDL3_image::SDL3_image SDL3_mixer::SDL3_mixer pugixml::pugixml)
 target_link_libraries(shadps4 PRIVATE stb::headers libusb::usb lfreist-hwinfo::hwinfo nlohmann_json::nlohmann_json miniz::miniz fdk-aac CLI11::CLI11 OpenAL::OpenAL Cpp_Httplib)
 
