@@ -9,7 +9,7 @@
 #include "core/libraries/libs.h"
 #include "core/libraries/np/np_error.h"
 #include "core/libraries/np/np_manager.h"
-#include "core/libraries/np/np_tus.h"
+#include "core/libraries/np/np_tus/np_tus.h"
 #include "core/libraries/np/np_types.h"
 #include "core/libraries/np/object_manager.h"
 #include "core/libraries/system/userservice.h"

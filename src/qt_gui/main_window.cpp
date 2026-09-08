@@ -1582,7 +1582,7 @@ void MainWindow::CreateDockWindows(bool newDock) {
         } else {
             m_game_list_frame->PopulateZarList();
         }
-        m_game_list_frame->m_zar_list->setVisible(!m_game_info->m_zar_games.isEmpty());
+        m_game_list_frame->m_zar_container->setVisible(!m_game_info->m_zar_games.isEmpty());
         m_list_container->show();
 
         ui->gameRectangleLayout->addWidget(m_list_container);
@@ -1605,7 +1605,7 @@ void MainWindow::CreateDockWindows(bool newDock) {
         } else {
             m_game_grid_frame->PopulateZarList();
         }
-        m_game_grid_frame->m_zar_list->setVisible(!m_game_info->m_zar_games.isEmpty());
+        m_game_grid_frame->m_zar_container->setVisible(!m_game_info->m_zar_games.isEmpty());
         m_grid_container->show();
 
         ui->gameRectangleLayout->addWidget(m_grid_container);
@@ -1684,15 +1684,15 @@ void MainWindow::LoadGameLists() {
 
     if (isTableList) {
         m_game_list_frame->PopulateGameList();
-        m_game_list_frame->m_zar_list->setVisible(!m_game_info->m_zar_games.isEmpty());
-        qDebug() << "LoadGameLists: List view, zar list visible:"
-                 << m_game_list_frame->m_zar_list->isVisible()
+        m_game_list_frame->m_zar_container->setVisible(!m_game_info->m_zar_games.isEmpty());
+        qDebug() << "LoadGameLists: List view, zar container visible:"
+                 << m_game_list_frame->m_zar_container->isVisible()
                  << "item count:" << m_game_list_frame->m_zar_list->count();
     } else {
         m_game_grid_frame->PopulateGameGrid(m_game_info->m_games, false);
-        m_game_grid_frame->m_zar_list->setVisible(!m_game_info->m_zar_games.isEmpty());
-        qDebug() << "LoadGameLists: Grid view, zar list visible:"
-                 << m_game_grid_frame->m_zar_list->isVisible()
+        m_game_grid_frame->m_zar_container->setVisible(!m_game_info->m_zar_games.isEmpty());
+        qDebug() << "LoadGameLists: Grid view, zar container visible:"
+                 << m_game_grid_frame->m_zar_container->isVisible()
                  << "item count:" << m_game_grid_frame->m_zar_list->count();
     }
 }
@@ -2120,7 +2120,11 @@ void MainWindow::CreateConnects() {
 
     connect(ui->installPkgButton, &QPushButton::clicked, this, [this]() {
         auto versionDialog = new VersionDialog(m_compat_info, this);
-        versionDialog->InstallPkgWithV7();
+        versionDialog->setAttribute(Qt::WA_DeleteOnClose);
+        connect(versionDialog, &VersionDialog::PkgInstalled, this,
+                [this]() { RefreshGameTable(); });
+        versionDialog->InstallPkg();
+        versionDialog->close();
     });
 
     connect(ui->launcherBox, &QCheckBox::clicked, this, [this](bool checked) {
@@ -2194,6 +2198,8 @@ void MainWindow::CreateConnects() {
 
     connect(ui->versionAct, &QAction::triggered, this, [this]() {
         auto versionDialog = new VersionDialog(m_compat_info, this);
+        connect(versionDialog, &VersionDialog::PkgInstalled, this,
+                [this]() { RefreshGameTable(); });
         versionDialog->show();
     });
     connect(ui->welcomeAct, &QAction::triggered, this, [this](bool checked) {
@@ -2275,6 +2281,8 @@ void MainWindow::CreateConnects() {
 
     connect(ui->versionButton, &QPushButton::clicked, this, [this]() {
         auto versionDialog = new VersionDialog(m_compat_info, this);
+        connect(versionDialog, &VersionDialog::PkgInstalled, this,
+                [this]() { RefreshGameTable(); });
         versionDialog->show();
     });
     connect(ui->bigPictureButton, &QPushButton::clicked, this,

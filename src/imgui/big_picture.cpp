@@ -1,6 +1,8 @@
 //  SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 //  SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <bit>
 #include <fstream>
 #include <limits>
 #include <cmrc/cmrc.hpp>
@@ -82,6 +84,14 @@ void Launch() {
         ImGui::FontStack::AddPrimaryUiFont(io.Fonts, 32.0f, Config::GetLanguage(), font_cfg, true);
     io.FontDefault = myFont;
 
+    io.FontDefault = ImGui::FontStack::AddPrimaryUiFont(io.Fonts, 64.0f, Config::GetLanguage(), font_cfg, true);
+    io.FontGlobalScale = 0.5f;
+    // size the big picture font atlas cap from the renderer limit
+    const auto max_dim = SDL_GetNumberProperty(SDL_GetRendererProperties(renderer),
+                                               SDL_PROP_RENDERER_MAX_TEXTURE_SIZE_NUMBER, 8192);
+    const int atlas_max = static_cast<int>(std::bit_floor(std::max<u64>(max_dim, 512)));
+    io.Fonts->TexMaxWidth = atlas_max;
+    io.Fonts->TexMaxHeight = atlas_max;
     io.Fonts->Build();
 
     ImGuiStyle& style = ImGui::GetStyle();
@@ -125,6 +135,7 @@ void Launch() {
         ImGuiViewport* viewport = ImGui::GetMainViewport();
         ImGui::SetNextWindowPos(viewport->WorkPos);
         ImGui::SetNextWindowSize(viewport->WorkSize);
+
         ImGuiWindowFlags window_flags =
             ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoScrollWithMouse;
 
@@ -132,15 +143,18 @@ void Launch() {
         ImGui::DrawPrettyBackground();
         ImGui::SetWindowFontScale(uiScale);
 
-        ImGuiWindowFlags child_flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-                                       ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NavFlattened;
+        ImGuiChildFlags child_flags = ImGuiChildFlags_Borders | ImGuiChildFlags_NavFlattened;
+
+        ImGuiWindowFlags child_window_flags =
+            ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse;
 
         if (ImGui::IsWindowAppearing()) {
             ImGui::SetNextWindowFocus();
         }
 
-        ImGui::BeginChild("ContentRegion", ImVec2(0, -ImGui::GetFrameHeightWithSpacing()), true,
-                          child_flags);
+        ImGui::BeginChild("ContentRegion", ImVec2(0, -ImGui::GetFrameHeightWithSpacing()),
+                          child_flags, child_window_flags);
+
         Overlay::TextCentered("Select Game");
         ImGui::Dummy(ImVec2(0.0f, 10.f * uiScale));
 
@@ -233,8 +247,9 @@ void Launch() {
     ImGui_ImplSDLRenderer3_Shutdown();
     ImGui_ImplSDL3_Shutdown();
     ImGui::DestroyContext();
-    SDL_DestroyWindow(window);
     SDL_DestroyRenderer(renderer);
+    renderer = nullptr;
+    SDL_DestroyWindow(window);
     SDL_Quit();
 
     Config::setBigPictureScale(static_cast<int>(uiScale * 1000));
@@ -242,7 +257,7 @@ void Launch() {
 
     if (runEbootPath != "") {
         auto* emulator = Common::Singleton<Core::Emulator>::Instance();
-        emulator->Run(runEbootPath);
+        emulator->Relaunch({"--log-append", "--game", Common::FS::PathToUTF8String(runEbootPath)});
     }
 }
 

@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -21,12 +23,14 @@
 #include "common/discord_rpc_handler.h"
 #endif
 #include "common/elf_info.h"
+#include "common/hack_features.h"
 #include "common/memory_patcher.h"
 #include "common/ntapi.h"
 #include "common/path_util.h"
 #include "common/polyfill_thread.h"
 #include "common/scm_rev.h"
 #include "common/singleton.h"
+#include "common/string_util.h"
 #include "common/zar_fs.h"
 #include "core/debug_state.h"
 #include "core/debugger.h"
@@ -268,6 +272,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     auto& game_info = Common::ElfInfo::Instance();
     game_info.initialized = true;
     game_info.game_serial = id;
+    Common::HackFeatures::Init(id);
     game_info.title = title;
     game_info.app_ver = app_version;
     game_info.firmware_ver = fw_version & 0xFFF00000;
@@ -597,7 +602,6 @@ void Emulator::Restart(std::filesystem::path eboot_path, const std::vector<std::
         args.push_back("--patch");
         args.push_back(MemoryPatcher::patch_file);
     }
-
     args.push_back("--wait-for-pid");
     args.push_back(std::to_string(Debugger::GetCurrentPid()));
 
@@ -612,8 +616,15 @@ void Emulator::Restart(std::filesystem::path eboot_path, const std::vector<std::
         }
     }
 
-    LOG_INFO(Common, "Restarting the emulator with args: {}", fmt::join(args, " "));
     Libraries::SaveData::Backup::StopThread();
+    Relaunch(std::move(args));
+}
+
+[[noreturn]] void Emulator::Relaunch(std::vector<std::string> args) {
+    const auto guest_args = std::find(args.begin(), args.end(), "--");
+    args.insert(guest_args, {"--wait-for-pid", std::to_string(Debugger::GetCurrentPid())});
+
+    LOG_INFO(Common, "Relaunching the emulator with args: {}", fmt::join(args, " "));
     Common::Log::Denitializer();
 
     auto& ipc = IPC::Instance();
@@ -625,22 +636,24 @@ void Emulator::Restart(std::filesystem::path eboot_path, const std::vector<std::
         }
     }
 #if defined(_WIN32)
-    std::string cmdline;
-    cmdline += "\"";
-    cmdline += executableName;
-    cmdline += "\"";
+    std::wstring cmdline;
+    // Emulator executable
+    const auto executable = Common::UTF8ToUTF16W(executableName);
+    cmdline += L"\"";
+    cmdline += executable;
+    cmdline += L"\"";
     for (const auto& arg : args) {
-        cmdline += " \"";
-        cmdline += arg;
-        cmdline += "\"";
+        cmdline += L" \"";
+        cmdline += Common::UTF8ToUTF16W(arg);
+        cmdline += L"\"";
     }
-    cmdline += "\0";
+    cmdline += L'\0';
 
-    STARTUPINFOA si{};
+    STARTUPINFOW si{};
     si.cb = sizeof(si);
     PROCESS_INFORMATION pi{};
-    bool success = CreateProcessA(nullptr, cmdline.data(), nullptr, nullptr, TRUE, 0, nullptr,
-                                  nullptr, &si, &pi);
+    bool success = CreateProcessW(executable.c_str(), cmdline.data(), nullptr, nullptr, TRUE, 0,
+                                  nullptr, nullptr, &si, &pi);
 
     if (!success) {
         std::cerr << "Failed to restart game: {}" << GetLastError() << std::endl;
@@ -769,13 +782,15 @@ void Emulator::UpdatePlayTime(const std::string& serial) {
 
     std::string playTimeSaved = fmt::format("{:d}:{:02d}:{:02d}", hours, minutes, seconds);
 
+    const std::time_t last_time_played = std::time(nullptr);
+
     std::ofstream outfile(filePath, std::ios::trunc);
     bool lineUpdated = false;
     for (const auto& l : lines) {
         std::istringstream iss(l);
         std::string s;
         if (iss >> s && s == serial) {
-            outfile << fmt::format("{} {}\n", serial, playTimeSaved);
+            outfile << fmt::format("{} {} {}\n", serial, playTimeSaved, last_time_played);
             lineUpdated = true;
         } else {
             outfile << l << "\n";
@@ -783,10 +798,10 @@ void Emulator::UpdatePlayTime(const std::string& serial) {
     }
 
     if (!lineUpdated) {
-        outfile << fmt::format("{} {}\n", serial, playTimeSaved);
+        outfile << fmt::format("{} {} {}\n", serial, playTimeSaved, last_time_played);
     }
 
-    LOG_INFO(Loader, "Playing time for {}: {}", serial, playTimeSaved);
+    LOG_INFO(Loader, "Playing time for {}: {} {}", serial, playTimeSaved, last_time_played);
 }
 
 } // namespace Core

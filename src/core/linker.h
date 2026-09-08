@@ -94,6 +94,11 @@ public:
                 return i;
             }
         }
+        for (u32 i = 0; i < m_modules.size(); i++) {
+            if (name.filename() == m_modules[i]->file.filename()) {
+                return i;
+            }
+        }
         return -1;
     }
 
@@ -139,13 +144,7 @@ public:
         }
     }
 
-    void LoadLibcInternal() {
-        for (auto& module : m_modules) {
-            if (module->name.contains("libSceLibcInternal")) {
-                module->Start(0, nullptr, nullptr);
-            }
-        }
-    }
+    void LoadLibcInternal() {}
 
     void SetHeapAPI(void* func[]) {
         heap_api = reinterpret_cast<AppHeapAPI>(func);
