@@ -6,7 +6,6 @@
 #include "common/config.h"
 #include "common/debug.h"
 #include "common/elf_info.h"
-#include "common/hack_features.h"
 #include "common/memory_patcher.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -374,13 +373,6 @@ void Rasterizer::DispatchDirect() {
         return;
     }
 
-    // The Order: 1886 VSM shadow hack: depth-reduction never dispatches,
-    // so force clear shader to write a value with non-zero low-4-bit tile mask.
-    // push_data.ud_regs[1] = user_data[4] → stored as float to tile SSBO.
-    // 0x7F80000F: +inf float with bitmask=0xF, safe from DenormFlushToZero.
-    if (Common::HackFeatures::isTheOrder1886 && cs.pgm_hash == 0x9846aaff) {
-        push_data.ud_regs[1] = 0x7F80000F;
-    }
     scheduler.EndRendering();
     pipeline->BindResources(set_writes, buffer_barriers, push_data);
 
@@ -683,6 +675,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
         const auto vsharp = desc.GetSharp(stage);
         if (!desc.IsSpecial() && vsharp.base_address != 0 && vsharp.GetSize() > 0) {
             const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
+            if (size != vsharp.GetSize()) {
+                LOG_ERROR(Render, "Clamped size from {} to {} for stage {:#x}", vsharp.GetSize(),
+                          size, stage.pgm_hash);
+            }
             const auto buffer_id = buffer_cache.FindBuffer(vsharp.base_address, size);
             buffer_bindings.emplace_back(buffer_id, vsharp, size);
         } else {
@@ -791,16 +787,6 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     boost::container::small_vector<u32, 8> image_descriptor_array_sizes;
 
     for (const auto& image_desc : stage.images) {
-        // The Order: 1886: CS shaders 0xa7b66f58/0xefaaab2b have garbage T# data
-        // (mode always 1, textures never actually sampled). Bind empty descriptors
-        // instead of letting texture cache parse invalid sharp data and crash the driver.
-        if (Common::HackFeatures::isTheOrder1886 &&
-            (stage.pgm_hash == 0xa7b66f58 || stage.pgm_hash == 0xefaaab2b)) {
-            image_bindings.emplace_back(std::piecewise_construct, std::tuple{}, std::tuple{});
-            image_descriptor_array_sizes.push_back(1);
-            continue;
-        }
-
         const auto tsharp = image_desc.GetSharp(stage);
         if (texture_cache.IsMeta(tsharp.Address())) {
             LOG_WARNING(Render_Vulkan, "Unexpected metadata read by a shader (texture)");
@@ -947,12 +933,6 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
     for (const auto& sampler : stage.samplers) {
         auto ssharp = sampler.GetSharp(stage);
-        if (sampler.disable_aniso) {
-            const auto& tsharp = stage.images[sampler.associated_image].GetSharp(stage);
-            if (tsharp.base_level == 0 && tsharp.last_level == 0) {
-                ssharp.max_aniso.Assign(AmdGpu::AnisoRatio::One);
-            }
-        }
         const auto vk_sampler = texture_cache.GetSampler(ssharp, liverpool->regs.ta_bc_base);
         image_infos.emplace_back(vk_sampler, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
         auto& set_write = set_writes[set_write_index++];

@@ -6,6 +6,7 @@
 #include "common/decoder.h"
 #include "common/signal_context.h"
 #include "core/libraries/kernel/threads/exception.h"
+#include "core/libraries/kernel/threads/pthread.h"
 #include "core/signals.h"
 
 #ifdef _WIN32
@@ -143,6 +144,31 @@ SignalDispatch::SignalDispatch() {
                "Failed to register illegal instruction signal handler.");
     ASSERT_MSG(sigaction(SIGSLEEP, &action, nullptr) == 0,
                "Failed to register sleep signal handler.");
+#endif
+}
+
+void SignalDispatch::RemoveHandlers() {
+    // asserting here would get into an infinite loop until too
+    // many nested exceptions makes the OS kill the process
+#if defined(_WIN32)
+    if (!(RemoveVectoredExceptionHandler(handle))) {
+        LOG_CRITICAL(Core, "Failed to remove exception handler.");
+        std::quick_exit(1);
+    }
+#else
+    struct sigaction action{};
+    action.sa_handler = SIG_DFL;
+    action.sa_flags = 0;
+    sigemptyset(&action.sa_mask);
+
+    if (!(sigaction(SIGSEGV, &action, nullptr) == 0 && sigaction(SIGBUS, &action, nullptr) == 0 &&
+          sigaction(SIGILL, &action, nullptr) == 0 && sigaction(SIGFPE, &action, nullptr) == 0 &&
+          sigaction(SIGTRAP, &action, nullptr) == 0 && sigaction(SIGSYS, &action, nullptr) == 0 &&
+          sigaction(SIGUSR1, &action, nullptr) == 0 &&
+          sigaction(SIGSLEEP, &action, nullptr) == 0)) {
+        LOG_CRITICAL(Core, "Failed to remove signal handlers.");
+        std::quick_exit(1);
+    }
 #endif
 }
 
