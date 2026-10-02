@@ -32,6 +32,7 @@ struct TilingInfo {
     u32 bank_swizzle;
     u32 micro_tiled_mips;
     u32 num_mips;
+    u32 num_slices;
     std::array<ImageInfo::MipInfo, 16> mips;
 };
 
