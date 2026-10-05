@@ -3,16 +3,26 @@
 
 #pragma once
 
+#include <array>
+#include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <cstring>
+#include <deque>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <queue>
 
+#include <boost/container/static_vector.hpp>
+
+#include "common/interval_set.h"
 #include "common/unique_function.h"
 #include "video_core/amdgpu/regs_color.h"
 #include "video_core/amdgpu/regs_primitive.h"
-#include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
+#include "video_core/renderer_vulkan/vk_semaphore.h"
+#include "vulkan/vulkan.hpp"
 
 namespace tracy {
 class VkCtxScope;
@@ -53,10 +63,10 @@ struct RenderState {
 static_assert(std::has_unique_object_representations_v<RenderState>);
 
 struct SubmitInfo {
-    std::array<vk::Semaphore, 3> wait_semas;
-    std::array<u64, 3> wait_ticks;
-    std::array<vk::Semaphore, 3> signal_semas;
-    std::array<u64, 3> signal_ticks;
+    std::array<vk::Semaphore, 4> wait_semas;
+    std::array<u64, 4> wait_ticks;
+    std::array<vk::Semaphore, 4> signal_semas;
+    std::array<u64, 4> signal_ticks;
     vk::Fence fence;
     u32 num_wait_semas;
     u32 num_signal_semas;
@@ -124,6 +134,12 @@ struct DynamicState {
         bool color_write_masks : 1;
         bool line_width : 1;
         bool feedback_loop_enabled : 1;
+        /// Set by the rasterizer, which keeps the vertex input it last set.
+        bool vertex_input : 1;
+        bool graphics_pipeline : 1;
+        bool compute_pipeline : 1;
+        bool graphics_push_constants : 1;
+        bool compute_push_constants : 1;
     } dirty_state{};
 
     Viewports viewports{};
@@ -161,6 +177,14 @@ struct DynamicState {
     ColorWriteMasks color_write_masks{};
     float line_width{};
     bool feedback_loop_enabled{};
+
+    vk::Pipeline graphics_pipeline{};
+    vk::Pipeline compute_pipeline{};
+    /// Push constants last pushed for graphics and for compute stages. Pipelines of each kind all
+    /// have the same range of them, and stages keep the ones last pushed for them.
+    static constexpr size_t MaxPushConstantsSize = 128;
+    std::array<u8, MaxPushConstantsSize> graphics_push_constants{};
+    std::array<u8, MaxPushConstantsSize> compute_push_constants{};
 
     /// Commits the dynamic state to the provided command buffer.
     void Commit(const Instance& instance, const vk::CommandBuffer& cmdbuf);
@@ -343,7 +367,51 @@ struct DynamicState {
             dirty_state.feedback_loop_enabled = true;
         }
     }
+
+    /// Binds a graphics pipeline unless it is bound already. Draws mostly use the pipeline the
+    /// draw before did, and binding it again for each took a good part of their driver time.
+    void BindGraphicsPipeline(const vk::CommandBuffer& cmdbuf, vk::Pipeline pipeline) {
+        if (dirty_state.graphics_pipeline || graphics_pipeline != pipeline) {
+            cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
+            graphics_pipeline = pipeline;
+            dirty_state.graphics_pipeline = false;
+        }
+    }
+
+    /// The same for compute pipelines, which every compute pipeline bound in the command buffer
+    /// has to be bound with, as dispatches in a row often use the same.
+    void BindComputePipeline(const vk::CommandBuffer& cmdbuf, vk::Pipeline pipeline) {
+        if (dirty_state.compute_pipeline || compute_pipeline != pipeline) {
+            cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline);
+            compute_pipeline = pipeline;
+            dirty_state.compute_pipeline = false;
+        }
+    }
+
+    /// Pushes constants for all graphics or all compute stages, unless the same were pushed for
+    /// them last. They mostly are, draw after draw.
+    void PushConstants(const vk::CommandBuffer& cmdbuf, vk::PipelineLayout layout, bool compute,
+                       vk::ShaderStageFlags stages, const void* data, u32 size) {
+        auto& last = compute ? compute_push_constants : graphics_push_constants;
+        const bool dirty =
+            compute ? dirty_state.compute_push_constants : dirty_state.graphics_push_constants;
+        if (size > last.size() || dirty || std::memcmp(last.data(), data, size) != 0) {
+            cmdbuf.pushConstants(layout, stages, 0u, size, data);
+            if (size > last.size()) {
+                return;
+            }
+            std::memcpy(last.data(), data, size);
+            if (compute) {
+                dirty_state.compute_push_constants = false;
+            } else {
+                dirty_state.graphics_push_constants = false;
+            }
+        }
+    }
 };
+
+using SessionFunc = Common::UniqueFunction<void>;
+using SubmitFunc = Common::UniqueFunction<void, SubmitInfo&>;
 
 class Scheduler {
 public:
@@ -373,9 +441,42 @@ public:
     /// Ends current rendering scope.
     void EndRendering();
 
+    /// Starts a new session.
+    void BeginSession();
+
+    /// Returns the command buffer for uploads, which runs before the current one, between
+    /// barriers that order it after all work before and before all work after.
+    vk::CommandBuffer UploadCommandBuffer();
+
+    /// Sets a function to be called on every session finalization.
+    void SetSessionCallback(SessionFunc&& on_session) {
+        this->on_session = std::move(on_session);
+    }
+
+    /// Sets a function to be called on every scheduler submission.
+    void SetSubmitCallback(SubmitFunc&& on_submit) {
+        this->on_submit = std::move(on_submit);
+    }
+
     /// Returns the current render state.
     const RenderState& GetRenderState() const {
         return render_state;
+    }
+
+    /// Counts a draw or dispatch recorded since the last submission.
+    void CountWork() noexcept {
+        ++work_since_submit;
+    }
+
+    /// Submits what was recorded so far if there is a lot of it and the next draw renders to
+    /// other targets, so it starts a render pass anyway. The GPU then works on it while the rest
+    /// of the game's commands are recorded, instead of idling until all of them are, and work
+    /// the game waits for, such as readbacks, is done that much sooner.
+    void SubmitIfWorkPiledUp(const RenderState& next_state) {
+        static constexpr u32 PiledUpWork = 1024;
+        if (work_since_submit >= PiledUpWork && !(is_rendering && render_state == next_state)) {
+            Flush();
+        }
     }
 
     /// Returns the current pipeline dynamic state tracking.
@@ -385,33 +486,52 @@ public:
 
     /// Returns the current command buffer.
     vk::CommandBuffer CommandBuffer() const {
-        return current_cmdbuf;
+        return sessions.back().primary;
+    }
+
+    /// Identifies the command buffer being recorded.
+    [[nodiscard]] u64 SessionId() const noexcept {
+        return session_id;
     }
 
     /// Returns the current command buffer tick.
     [[nodiscard]] u64 CurrentTick() const noexcept {
-        return master_semaphore.CurrentTick();
+        return work_semaphore.CurrentTick();
     }
 
     /// Returns true when a tick has been triggered by the GPU.
     [[nodiscard]] bool IsFree(u64 tick) noexcept {
-        if (master_semaphore.IsFree(tick)) {
+        if (work_semaphore.IsFree(tick)) {
             return true;
         }
-        master_semaphore.Refresh();
-        return master_semaphore.IsFree(tick);
+        work_semaphore.Refresh();
+        return work_semaphore.IsFree(tick);
     }
 
-    /// Returns the master timeline semaphore.
-    [[nodiscard]] MasterSemaphore* GetMasterSemaphore() noexcept {
-        return &master_semaphore;
+    /// Returns the scheduler timeline semaphore.
+    [[nodiscard]] Semaphore* GetWorkSemaphore() noexcept {
+        return &work_semaphore;
     }
 
     /// Defers an operation until the gpu has reached the current cpu tick.
     /// Will be run when submitting or calling PopPendingOperations.
     void DeferOperation(Common::UniqueFunction<void>&& func) {
+        std::unique_lock lk(pending_ops_mutex);
         pending_ops.emplace(std::move(func), CurrentTick());
+        num_pending_ops.store(pending_ops.size(), std::memory_order_release);
     }
+
+    /// Measures the time the GPU spends on the command buffers submitted from now on, for the
+    /// perf summary.
+    void MeasureGpuTime();
+
+    /// Draws, dispatches, barriers, render passes, switches between draws and dispatches and
+    /// barriers right before them.
+    using CostCounts = std::array<u64, 6>;
+
+    /// Notes that the work recorded from now on is dispatches, or draws, where the work before
+    /// it was the other kind. The GPU time of each run of them is measured, for the perf summary.
+    void MarkWorkRun(bool compute);
 
     /// Defers an operation until the gpu has reached the current cpu tick.
     /// Runs as soon as possible in another thread.
@@ -426,30 +546,100 @@ public:
     static std::mutex submit_mutex;
 
 private:
-    void AllocateWorkerCommandBuffers();
+    static constexpr u32 RunMarksPerPair = 32;
+    using RunMarks = boost::container::static_vector<bool, RunMarksPerPair>;
+
+    void EndSession();
 
     void SubmitExecution(SubmitInfo& info);
 
     void PriorityPendingOpsThread(std::stop_token stoken);
 
+    /// Counts the time the GPU spent on submitted command buffers that are done, from timestamps
+    /// written at their start and end, for the perf summary.
+    void CollectGpuTimes();
+
+    /// Counts the GPU time of the runs of draws and of dispatches in a command buffer, between
+    /// start and end.
+    void CountWorkRuns(u32 pair, u64 start, u64 end, bool first_run_compute,
+                       const RunMarks& run_marks);
+
+    /// Adds the GPU time of a command buffer to the fit of its cost to the work in it, and logs
+    /// the fit every few seconds.
+    void FitGpuCost(double gpu_us, const CostCounts& counts);
+
 private:
     const Instance& instance;
-    MasterSemaphore master_semaphore;
+    Semaphore work_semaphore;
     CommandPool command_pool;
     DynamicState dynamic_state;
-    vk::CommandBuffer current_cmdbuf;
+    SessionFunc on_session{};
+    SubmitFunc on_submit{};
+    struct Session {
+        vk::CommandBuffer upload{};
+        vk::CommandBuffer primary{};
+        /// The pair of timestamp queries written around the primary command buffer, if any.
+        u32 timestamp_pair = NoTimestamps;
+        /// The work counted when it began, and the thread that counted it.
+        CostCounts counts{};
+        std::thread::id thread{};
+        /// Whether the run of work the command buffer began in was dispatches.
+        bool first_run_compute{};
+        /// Where runs of the other kind of work began in it, with timestamps written there, and
+        /// whether more began than could be marked.
+        RunMarks run_marks;
+        bool run_marks_overflow{};
+    };
+    std::vector<Session> sessions;
+    u64 session_id{};
+    static constexpr u32 NoTimestamps = ~0u;
+    static constexpr u32 NumTimestampPairs = 256;
+    /// Timestamp queries, two for each command buffer measured, used in turn.
+    vk::UniqueQueryPool timestamp_pool;
+    /// Timestamp queries where runs of draws and dispatches begin, this many for each pair.
+    vk::UniqueQueryPool run_pool;
+    double timestamp_period_ns{};
+    u64 timestamp_mask{};
+    u32 next_timestamp_pair{};
+    /// Whether the work recorded last was dispatches.
+    bool run_compute{};
+    struct SubmittedTimestamps {
+        u64 tick;
+        u32 pair;
+        /// What the command buffer held, or nothing known if counted on several threads.
+        std::optional<CostCounts> counts;
+        bool first_run_compute{};
+        RunMarks run_marks;
+        bool run_marks_overflow{};
+    };
+    /// Submitted pairs whose results aren't read yet, in the order they were submitted.
+    std::deque<SubmittedTimestamps> submitted_timestamps;
+    /// The latest end of GPU work counted, so overlapping command buffers aren't counted twice.
+    u64 counted_gpu_end{};
+    /// Sums for a least squares fit of the GPU time of command buffers to the work counted in
+    /// them and a cost of their own.
+    static constexpr size_t NumCostTerms = std::tuple_size_v<CostCounts> + 1;
+    std::array<std::array<double, NumCostTerms>, NumCostTerms> cost_xx{};
+    std::array<double, NumCostTerms> cost_xy{};
+    double cost_yy{};
+    u64 cost_samples{};
+    std::chrono::steady_clock::time_point last_cost_report{};
     std::condition_variable_any event_cv;
     struct PendingOp {
         Common::UniqueFunction<void> callback;
         u64 gpu_tick;
     };
     std::queue<PendingOp> pending_ops;
+    std::recursive_mutex pending_ops_mutex;
+    /// The size of pending_ops, checked for every draw without taking the lock.
+    std::atomic<size_t> num_pending_ops{};
     std::queue<PendingOp> priority_pending_ops;
     std::mutex priority_pending_ops_mutex;
     std::condition_variable_any priority_pending_ops_cv;
     std::jthread priority_pending_ops_thread;
     RenderState render_state;
     bool is_rendering = false;
+    u32 work_since_submit = 0;
     tracy::VkCtxScope* profiler_scope{};
 };
 

@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "common/config.h"
 #include "common/elf_info.h"
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
@@ -20,21 +19,35 @@ s32 PS4_SYSV_ABI sceKernelIsInSandbox() {
 s32 PS4_SYSV_ABI sceKernelIsNeoMode() {
     static s32 IsNeoMode = -1;
     if (IsNeoMode == -1) {
-        IsNeoMode = Config::isNeoModeConsole() &&
+        IsNeoMode = EmulatorSettings.IsNeo() &&
                     Common::ElfInfo::Instance().GetPSFAttributes().support_neo_mode;
     }
     return IsNeoMode;
 }
 
 s32 PS4_SYSV_ABI sceKernelHasNeoMode() {
-    return Config::isNeoModeConsole();
+    return EmulatorSettings.IsNeo();
+}
+
+s32 PS4_SYSV_ABI sceKernelIsDevkit() {
+    LOG_INFO(Lib_Kernel, "called, isDevkit: {}", EmulatorSettings.IsDevKit());
+    return EmulatorSettings.IsDevKit();
+}
+
+s32 PS4_SYSV_ABI sceKernelIsProspero() {
+    LOG_INFO(Lib_Kernel, "called: returning false");
+    return 0;
+}
+
+s32 PS4_SYSV_ABI sceKernelIsCEX() {
+    return !sceKernelIsDevkit();
 }
 
 s32 PS4_SYSV_ABI sceKernelGetMainSocId() {
     // These hardcoded values are based on hardware observations.
     // Different models of PS4/PS4 Pro likely return slightly different values.
     LOG_DEBUG(Lib_Kernel, "called");
-    if (Config::isNeoModeConsole()) {
+    if (EmulatorSettings.IsNeo()) {
         return 0x740f30;
     }
     return 0x710f10;
@@ -77,10 +90,8 @@ s32 PS4_SYSV_ABI sceKernelLoadStartModule(const char* moduleFileName, u64 args, 
     LOG_INFO(Lib_Kernel, "called filename = {}, args = {}", moduleFileName, args);
     ASSERT(flags == 0);
 
-    auto* mnt = Common::Singleton<Core::FileSys::MntPoints>::Instance();
     auto* linker = Common::Singleton<Core::Linker>::Instance();
 
-    std::filesystem::path path;
     std::string guest_path(moduleFileName);
 
     s32 handle = -1;
@@ -88,22 +99,19 @@ s32 PS4_SYSV_ABI sceKernelLoadStartModule(const char* moduleFileName, u64 args, 
     if (guest_path[0] == '/') {
         // try load /system/common/lib/ +path
         // try load /system/priv/lib/   +path
-        path = mnt->GetHostPath(guest_path);
-        handle = linker->LoadAndStartModule(path, args, argp, pRes);
+        handle = linker->LoadAndStartModule(guest_path, args, argp, pRes);
         if (handle != -1)
             return handle;
     } else {
         if (!guest_path.contains('/')) {
-            path = mnt->GetHostPath("/app0/" + guest_path);
-            handle = linker->LoadAndStartModule(path, args, argp, pRes);
+            handle = linker->LoadAndStartModule("/app0/" + guest_path, args, argp, pRes);
             if (handle != -1)
                 return handle;
             // if ((flags & 0x10000) != 0)
             //  try load /system/priv/lib/   +basename
             //  try load /system/common/lib/ +basename
         } else {
-            path = mnt->GetHostPath(guest_path);
-            handle = linker->LoadAndStartModule(path, args, argp, pRes);
+            handle = linker->LoadAndStartModule(guest_path, args, argp, pRes);
             if (handle != -1)
                 return handle;
         }
@@ -294,6 +302,10 @@ void RegisterProcess(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("WB66evu8bsU", "libkernel", 1, "libkernel", sceKernelGetCompiledSdkVersion);
     LIB_FUNCTION("WslcK1FQcGI", "libkernel", 1, "libkernel", sceKernelIsNeoMode);
     LIB_FUNCTION("rNRtm1uioyY", "libkernel", 1, "libkernel", sceKernelHasNeoMode);
+    LIB_FUNCTION("QNjGUdj1HPM", "libkernel", 1, "libkernel", sceKernelIsDevkit);
+    LIB_FUNCTION("mpxAdqW7dKY", "libkernel", 1, "libkernel", sceKernelIsProspero);
+    LIB_FUNCTION("mpxAdqW7dKY", "libkernel_cpumode_platform", 1, "libkernel", sceKernelIsProspero);
+    LIB_FUNCTION("8aCOCGoRkUI", "libkernel", 1, "libkernel", sceKernelIsCEX);
     LIB_FUNCTION("0vTn5IDMU9A", "libkernel", 1, "libkernel", sceKernelGetMainSocId);
     LIB_FUNCTION("VOx8NGmHXTs", "libkernel", 1, "libkernel", sceKernelGetCpumode);
     LIB_FUNCTION("g0VTBxfJyu0", "libkernel", 1, "libkernel", sceKernelGetCurrentCpu);
@@ -302,12 +314,14 @@ void RegisterProcess(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("LwG8g3niqwA", "libkernel", 1, "libkernel", sceKernelDlsym);
     LIB_FUNCTION("RpQJJVKTiFM", "libkernel", 1, "libkernel", sceKernelGetModuleInfoForUnwind);
     LIB_FUNCTION("f7KBOafysXo", "libkernel", 1, "libkernel", sceKernelGetModuleInfoFromAddr);
+    LIB_FUNCTION("f7KBOafysXo", "libkernel_psmkit", 1, "libkernel", sceKernelGetModuleInfoFromAddr);
     LIB_FUNCTION("kUpgrXIrz7Q", "libkernel", 1, "libkernel", sceKernelGetModuleInfo);
     LIB_FUNCTION("QgsKEUfkqMA", "libkernel", 1, "libkernel", sceKernelGetModuleInfo2);
     LIB_FUNCTION("QgsKEUfkqMA", "libkernel_module_info", 1, "libkernel", sceKernelGetModuleInfo2);
     LIB_FUNCTION("HZO7xOos4xc", "libkernel", 1, "libkernel", sceKernelGetModuleInfoInternal);
     LIB_FUNCTION("IuxnUuXk6Bg", "libkernel", 1, "libkernel", sceKernelGetModuleList);
     LIB_FUNCTION("ZzzC3ZGVAkc", "libkernel", 1, "libkernel", sceKernelGetModuleList2);
+    LIB_FUNCTION("ZzzC3ZGVAkc", "libkernel_module_info", 1, "libkernel", sceKernelGetModuleList2);
     LIB_FUNCTION("kg4x8Prhfxw", "libkernel", 1, "libkernel", posix_getuid);
     LIB_FUNCTION("6Z83sYWFlA8", "libkernel", 1, "libkernel", exit);
 }

@@ -14,6 +14,7 @@ T get(uintptr_t addr) {
     return val;
 }
 
+// Windows static guest red-zone protection
 static size_t GetEncodedSize(u8 encoding) {
     switch (encoding & DW_EH_PE_format_mask) {
     case DW_EH_PE_ptr:
@@ -38,7 +39,7 @@ static uintptr_t getEncodedP(uintptr_t& addr, uintptr_t end, u8 encoding, uintpt
     uintptr_t result;
 
     // First get value
-    switch (encoding & DW_EH_PE_format_mask) {
+    switch (encoding & DW_EH_PE_format_mask) { // Windows static guest red-zone protection
     case DW_EH_PE_ptr:
         result = get<uintptr_t>(addr);
         p += sizeof(uintptr_t);
@@ -81,7 +82,7 @@ static uintptr_t getEncodedP(uintptr_t& addr, uintptr_t end, u8 encoding, uintpt
     }
 
     // Then add relative offset
-    switch (encoding & DW_EH_PE_application_mask) {
+    switch (encoding & DW_EH_PE_application_mask) { // Windows static guest red-zone protection
     case DW_EH_PE_absptr:
         // do nothing
         break;
@@ -148,11 +149,12 @@ bool DecodeEHHdr(uintptr_t ehHdrStart, uintptr_t ehHdrEnd, EHHeaderInfo& ehHdrIn
     ehHdrInfo.fde_count =
         fde_count_enc == DW_EH_PE_omit ? 0 : getEncodedP(p, ehHdrEnd, fde_count_enc, ehHdrStart);
     ehHdrInfo.table = p;
-    ehHdrInfo.datarel_base = ehHdrStart;
+    ehHdrInfo.datarel_base = ehHdrStart; // Windows static guest red-zone protection
 
     return true;
 }
 
+// Windows static guest red-zone protection
 bool DecodeEHHdrTable(const EHHeaderInfo& ehHdrInfo, uintptr_t ehHdrEnd,
                       std::vector<uintptr_t>& functionStarts) {
     functionStarts.clear();

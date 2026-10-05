@@ -7,37 +7,30 @@
 #include <optional>
 #include <vector>
 
-#ifdef ENABLE_QT_GUI
-class QString; // to avoid including <QString> in this header
-#endif
-
 namespace Common::FS {
 
 enum class PathType {
-    UserDir,         // Where shadPS4 stores its data.
-    LogDir,          // Where log files are stored.
-    ScreenshotsDir,  // Where screenshots are stored.
-    ShaderDir,       // Where shaders are stored.
-    TempDataDir,     // Where game temp data is stored.
-    GameDataDir,     // Where game data is stored.
-    SysModuleDir,    // Where system modules are stored.
-    DownloadDir,     // Where downloads/temp files are stored.
-    CapturesDir,     // Where rdoc captures are stored.
-    CheatsDir,       // Where cheats are stored.
-    PatchesDir,      // Where patches are stored.
-    MetaDataDir,     // Where game metadata (e.g. trophies and menu backgrounds) is stored.
-    CustomTrophy,    // Where custom files for trophies are stored.
-    CustomConfigs,   // Where custom files for different games are stored.
-    CustomThemes,    // Where custom themes for emulator are stored.
-    ModsFolder,      // Where mods for games are stored.
-    CacheDir,        // Where pipeline and shader cache is stored.
-    CustomAudios,    // Where custom audios are stored.
-    FontsDir,        // Where dumped system fonts are stored.
-    HomeDir,         // Where home directory is stored.
-    CustomModulesDir // Where custom modules are stored.
+    UserDir,          // Where shadPS4 stores its data.
+    LogDir,           // Where log files are stored.
+    ScreenshotsDir,   // Where screenshots are stored.
+    ShaderDir,        // Where shaders are stored.
+    TempDataDir,      // Where game temp data is stored.
+    GameDataDir,      // Where game data is stored.
+    SysModuleDir,     // Where system modules are stored.
+    DownloadDir,      // Where downloads/temp files are stored.
+    CapturesDir,      // Where rdoc captures are stored.
+    CheatsDir,        // Where cheats are stored.
+    PatchesDir,       // Where patches are stored.
+    MetaDataDir,      // Where game metadata (e.g. trophies and menu backgrounds) is stored.
+    CustomTrophy,     // Where custom files for trophies are stored.
+    CustomConfigs,    // Where custom files for different games are stored.
+    CacheDir,         // Where pipeline and shader cache is stored.
+    FontsDir,         // Where dumped system fonts are stored.
+    TrophyDir,        // Where general trophy metadata is stored.
+    HomeDir,          // PS4 home directory
+    CustomModulesDir, // Where custom modules are stored.
+    LicensesDir,      // Where license files are stored.
 };
-
-enum class PathInitState { Uninitialized, Portable, Global };
 
 constexpr auto PORTABLE_DIR = "user";
 
@@ -55,14 +48,12 @@ constexpr auto PATCHES_DIR = "patches";
 constexpr auto METADATA_DIR = "game_data";
 constexpr auto CUSTOM_TROPHY = "custom_trophy";
 constexpr auto CUSTOM_CONFIGS = "custom_configs";
-constexpr auto CUSTOM_THEMES = "custom_themes";
-constexpr auto MODS_FOLDER = "mods_folder";
 constexpr auto CACHE_DIR = "cache";
-constexpr auto AUDIO_DIR = "custom_audios";
 constexpr auto FONTS_DIR = "fonts";
 constexpr auto TROPHY_DIR = "trophy";
 constexpr auto HOME_DIR = "home";
 constexpr auto CUSTOM_MODULES_DIR = "custom_modules";
+constexpr auto LICENSES_DIR = "licenses";
 
 // Filenames
 constexpr auto LOG_FILE = "shad_log.txt";
@@ -117,53 +108,18 @@ constexpr auto LOG_FILE = "shad_log.txt";
 void SetUserPath(PathType user_path, const std::filesystem::path& new_path);
 
 /**
- * Gets the full path to the currently running executable.
- *
- * @returns The filesystem path of the executable, or empty if unavailable.
- */
-[[nodiscard]] std::filesystem::path GetExecutablePath();
-
-#ifdef ENABLE_QT_GUI
-/**
- * Converts an std::filesystem::path to a QString.
- * The native underlying string of a path is wstring on Windows and string on POSIX.
- *
- * @param result The resulting QString
- * @param path The path to convert
- */
-void PathToQString(QString& result, const std::filesystem::path& path);
-
-/**
- * Converts a QString to an std::filesystem::path.
- * The native underlying string of a path is wstring on Windows and string on POSIX.
- *
- * @param path The path to convert
- */
-[[nodiscard]] std::filesystem::path PathFromQString(const QString& path);
-#endif
-
-/**
- * Recursively searches for a game directory by its ID.
+ * Recursively searches for an installed game by its ID.
  * Limits search depth to prevent excessive filesystem traversal.
  *
  * @param dir Base directory to start the search from
  * @param game_id The game ID to search for
  * @param max_depth Maximum directory depth to search
  *
- * @returns Path to eboot.bin if found, std::nullopt otherwise
+ * @returns A path to eboot.bin for an unpacked game, or the ".zar" archive itself for a
+ *          packed one. std::nullopt if the game isn't found.
  */
 [[nodiscard]] std::optional<std::filesystem::path> FindGameByID(const std::filesystem::path& dir,
                                                                 const std::string& game_id,
                                                                 int max_depth);
-
-void InitializeUserPaths(PathInitState state);
-
-[[nodiscard]] PathInitState GetUserPathInitState();
-
-[[nodiscard]] bool IsUserPathsInitialized();
-
-[[nodiscard]] std::filesystem::path GetPortablePath();
-
-[[nodiscard]] std::filesystem::path GetGlobalPath();
 
 } // namespace Common::FS

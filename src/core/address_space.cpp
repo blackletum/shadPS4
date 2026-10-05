@@ -2,13 +2,16 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <map>
+#include <mutex>
+#include <shared_mutex>
+#include <fmt/format.h>
 #include "common/alignment.h"
 #include "common/arch.h"
 #include "common/assert.h"
-#include "common/config.h"
 #include "common/elf_info.h"
 #include "common/error.h"
 #include "core/address_space.h"
+#include "core/emulator_settings.h"
 #include "core/libraries/kernel/memory.h"
 #include "core/memory.h"
 #include "libraries/error_codes.h"
@@ -190,7 +193,8 @@ struct AddressSpace::Impl {
         user_size = supported_user_max - USER_MIN - 1;
 
         // Increase BackingSize to account for config options.
-        BackingSize += Config::getExtraDmemInMbytes() * 1_MB;
+        BackingSize += EmulatorSettings.GetExtraDmemInMBytes() * 1_MB +
+                       EmulatorSettings.GetExtraFmemInMBytes() * 1_MB;
 
         // Allocate backing file that represents the total physical memory.
         backing_handle = CreateFileMapping2(INVALID_HANDLE_VALUE, nullptr, FILE_MAP_ALL_ACCESS,
@@ -464,10 +468,10 @@ struct AddressSpace::Impl {
         }
     }
 
-    void Unmap(VAddr virtual_addr, u64 size) {
+    VAddr Unmap(VAddr virtual_addr, u64* size) {
         std::scoped_lock lk{mutex};
         // Loop through all regions in the requested range
-        u64 remaining_size = size;
+        u64 remaining_size = *size;
         VAddr current_addr = virtual_addr;
         while (remaining_size > 0) {
             // Get a pointer to the region containing virtual_addr
@@ -503,10 +507,15 @@ struct AddressSpace::Impl {
 
         // Coalesce any free space produced from these unmaps.
         CoalesceFreeRegions(virtual_addr);
+
+        return virtual_addr;
     }
 
     void Protect(VAddr virtual_addr, u64 size, bool read, bool write, bool execute) {
-        std::scoped_lock lk{mutex};
+        // Only the regions have to stay put meanwhile. The GPU thread protecting memory again
+        // and game threads unprotecting what they fault on did it one at a time under this lock,
+        // over a thousand times a frame, while the page tracker already orders them for a page.
+        std::shared_lock lk{mutex};
         DWORD new_flags{};
 
         if (write && !read) {
@@ -555,11 +564,10 @@ struct AddressSpace::Impl {
             const u64 range_size = std::min(region.base + region.size, virtual_end) - range_addr;
             DWORD old_flags{};
             if (!VirtualProtectEx(process, LPVOID(range_addr), range_size, new_flags, &old_flags)) {
-                LOG_ERROR(Core,
-                          "Protect: VirtualProtectEx failed for address {:#x}, size {:#x} "
-                          "(error {}) -- skipping this sub-range instead of aborting",
-                          range_addr, range_size, GetLastError());
-                continue;
+                UNREACHABLE_MSG(
+                    "Failed to change virtual memory protection for address {:#x}, size "
+                    "{:#x}, error {}",
+                    virtual_addr, size, Common::GetLastErrorMsg());
             }
         }
     }
@@ -572,7 +580,7 @@ struct AddressSpace::Impl {
         return reserved_regions;
     }
 
-    std::mutex mutex;
+    std::shared_mutex mutex;
     HANDLE process{};
     HANDLE backing_handle{};
     u8* backing_base{};
@@ -630,7 +638,8 @@ enum PosixPageProtection {
 
 struct AddressSpace::Impl {
     Impl() {
-        BackingSize += Config::getExtraDmemInMbytes() * 1_MB;
+        BackingSize += EmulatorSettings.GetExtraDmemInMBytes() * 1_MB +
+                       EmulatorSettings.GetExtraFmemInMBytes() * 1_MB;
         // Allocate virtual address placeholder for our address space.
         system_managed_size = SystemManagedSize;
         system_reserved_size = SystemReservedSize;
@@ -691,7 +700,7 @@ struct AddressSpace::Impl {
                  fmt::ptr(user_base + user_size - 1));
 
         const VAddr system_managed_addr = reinterpret_cast<VAddr>(system_managed_base);
-        const VAddr system_reserved_addr = reinterpret_cast<VAddr>(system_managed_base);
+        const VAddr system_reserved_addr = reinterpret_cast<VAddr>(system_reserved_base);
         const VAddr user_addr = reinterpret_cast<VAddr>(user_base);
         m_free_regions.insert({system_managed_addr, system_managed_addr + system_managed_size});
         m_free_regions.insert({system_reserved_addr, system_reserved_addr + system_reserved_size});
@@ -755,15 +764,18 @@ struct AddressSpace::Impl {
         return ret;
     }
 
-    void Unmap(VAddr virtual_addr, u64 size) {
+    VAddr Unmap(VAddr virtual_addr, u64* size) {
         // Check to see if we are adjacent to any regions.
         VAddr start_address = virtual_addr;
-        VAddr end_address = start_address + size;
-        auto it = m_free_regions.find({start_address - 1, end_address + 1});
+        VAddr end_address = start_address + *size;
 
         // If we are, join with them, ensuring we stay in bounds.
+        auto it = m_free_regions.find({start_address - 1, end_address});
         if (it != m_free_regions.end()) {
             start_address = std::min(start_address, it->lower());
+        }
+        it = m_free_regions.find({start_address, end_address + 1});
+        if (it != m_free_regions.end()) {
             end_address = std::max(end_address, it->upper());
         }
 
@@ -774,6 +786,9 @@ struct AddressSpace::Impl {
         void* ret = mmap(reinterpret_cast<void*>(start_address), end_address - start_address,
                          PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
         ASSERT_MSG(ret != MAP_FAILED, "mmap failed: {}", strerror(errno));
+
+        *size = end_address - start_address;
+        return reinterpret_cast<VAddr>(ret);
     }
 
     void Protect(VAddr virtual_addr, u64 size, bool read, bool write, bool execute) {
@@ -818,6 +833,14 @@ AddressSpace::AddressSpace() : impl{std::make_unique<Impl>()} {
 AddressSpace::~AddressSpace() = default;
 
 void* AddressSpace::Map(VAddr virtual_addr, u64 size, PAddr phys_addr, bool is_exec) {
+    const VAddr end_addr = virtual_addr + size - 1;
+    if (phys_addr != -1 && std::bit_width(end_addr) <= Traits::ADDRESS_SPACE_BITS) {
+        const u64 base_page = virtual_addr >> Traits::PAGE_BITS;
+        for (u64 offset = 0; offset < size; offset += 16_KB) {
+            backing_pages[base_page + (offset >> Traits::PAGE_BITS)] =
+                backing_base + phys_addr + offset;
+        }
+    }
 #if ARCH_X86_64
     const auto prot = is_exec ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE;
 #else
@@ -838,8 +861,15 @@ void* AddressSpace::MapFile(VAddr virtual_addr, u64 size, u64 offset, u32 prot, 
 #endif
 }
 
-void AddressSpace::Unmap(VAddr virtual_addr, u64 size) {
-    impl->Unmap(virtual_addr, size);
+VAddr AddressSpace::Unmap(VAddr virtual_addr, u64* size) {
+    const VAddr end_addr = virtual_addr + *size - 1;
+    if (std::bit_width(end_addr) <= Traits::ADDRESS_SPACE_BITS) {
+        const u64 base_page = virtual_addr >> Traits::PAGE_BITS;
+        for (u64 offset = 0; offset < *size; offset += 16_KB) {
+            backing_pages[base_page + (offset >> Traits::PAGE_BITS)] = nullptr;
+        }
+    }
+    return impl->Unmap(virtual_addr, size);
 }
 
 void AddressSpace::Protect(VAddr virtual_addr, u64 size, MemoryPermission perms) {

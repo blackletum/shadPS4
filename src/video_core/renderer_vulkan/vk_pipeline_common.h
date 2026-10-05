@@ -3,9 +3,14 @@
 
 #pragma once
 
+#include <chrono>
+#include <memory>
+#include <string_view>
+
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/renderer_vulkan/vk_common.h"
+#include "video_core/renderer_vulkan/vk_pipeline_compiler.h"
 
 #include <boost/container/small_vector.hpp>
 
@@ -32,8 +37,27 @@ public:
              bool is_compute = false);
     virtual ~Pipeline();
 
-    vk::Pipeline Handle() const noexcept {
+    /// Returns the pipeline to bind, waiting for it to finish compiling if needed.
+    vk::Pipeline Handle() const {
+        WaitReady();
+        if (optimize_job && optimize_job->IsDone()) {
+            SwapInOptimized();
+        }
         return *pipeline;
+    }
+
+    /// Returns true once the pipeline can be bound without waiting for the compiler.
+    [[nodiscard]] bool IsReady() const noexcept {
+        return !compile_job || compile_job->IsDone();
+    }
+
+    /// Waits for the pipeline to finish compiling, compiling it on this thread if no compiler
+    /// thread has started on it yet.
+    void WaitReady() const;
+
+    /// Returns true for pipelines loaded from the pipeline cache rather than met in game.
+    [[nodiscard]] bool IsPreloaded() const noexcept {
+        return preloaded;
     }
 
     vk::PipelineLayout GetLayout() const noexcept {
@@ -41,7 +65,7 @@ public:
     }
 
     auto GetStages() const {
-        static_assert(static_cast<u32>(Shader::LogicalStage::Compute) == Shader::MaxStageTypes - 1);
+        static_assert(static_cast<u32>(Shader::SwStage::Compute) == Shader::MaxStageTypes - 1);
         if (is_compute) {
             return std::span{stages.cend() - 1, stages.cend()};
         } else {
@@ -49,7 +73,7 @@ public:
         }
     }
 
-    const Shader::Info& GetStage(Shader::LogicalStage stage) const noexcept {
+    const Shader::Info& GetStage(Shader::SwStage stage) const noexcept {
         return *stages[u32(stage)];
     }
 
@@ -58,19 +82,35 @@ public:
     }
 
     using DescriptorWrites = std::vector<vk::WriteDescriptorSet>;
-    using BufferBarriers = boost::container::small_vector<vk::BufferMemoryBarrier2, 16>;
-
-    void BindResources(DescriptorWrites& set_writes, const BufferBarriers& buffer_barriers,
-                       const Shader::PushData& push_data) const;
+    void BindResources(DescriptorWrites& set_writes, const Shader::PushData& push_data) const;
 
 protected:
     [[nodiscard]] std::string GetDebugString() const;
+
+    /// Stops any compilation still referring to this pipeline. Called by the destructors, before
+    /// the state a compile job reads goes away.
+    void CancelCompile() noexcept;
+
+    /// Logs a finished driver compile and accounts for it if it held up the thread.
+    void LogPipelineCreation(std::string_view kind, std::string_view debug_str,
+                             std::chrono::steady_clock::time_point start) const;
+
+    /// Replaces a pipeline built without optimizations with the optimized one built since.
+    void SwapInOptimized() const;
 
     const Instance& instance;
     Scheduler& scheduler;
     DescriptorHeap& desc_heap;
     const Shader::Profile& profile;
-    vk::UniquePipeline pipeline;
+    vk::PipelineCache pipeline_cache;
+    /// Written by compile_job, so it may only be used once IsReady() returns true.
+    mutable vk::UniquePipeline pipeline;
+    std::shared_ptr<PipelineCompileJob> compile_job;
+    /// Builds the optimized pipeline into optimized_pipeline, to replace one built without
+    /// optimizations to be used at once.
+    mutable std::shared_ptr<PipelineCompileJob> optimize_job;
+    mutable vk::UniquePipeline optimized_pipeline;
+    bool preloaded{};
     vk::UniquePipelineLayout pipeline_layout;
     vk::UniqueDescriptorSetLayout desc_layout;
     std::array<const Shader::Info*, Shader::MaxStageTypes> stages{};

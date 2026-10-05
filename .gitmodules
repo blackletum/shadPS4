@@ -66,11 +66,6 @@
 	path = externals/half
 	url = https://github.com/ROCm/half.git
 	shallow = true
-[submodule "externals/dear_imgui"]
-	path = externals/dear_imgui
-	url = https://github.com/shadps4-emu/ext-imgui.git
-	shallow = true
-	branch = docking
 [submodule "externals/pugixml"]
 	path = externals/pugixml
 	url = https://github.com/zeux/pugixml.git
@@ -99,23 +94,12 @@
 	url = https://github.com/shadps4-emu/ext-wepoll.git
 	shallow = true
 	branch = dist
-[submodule "externals/MoltenVK"]
-	path = externals/MoltenVK
-	url = https://github.com/shadPS4-emu/ext-MoltenVK.git
-	shallow = true
 [submodule "externals/json"]
 	path = externals/json
 	url = https://github.com/nlohmann/json.git
-[submodule "externals/sdl3_mixer"]
-	path = externals/sdl3_mixer
-	url = https://github.com/libsdl-org/SDL_mixer
-	shallow = true
 [submodule "externals/miniz"]
 	path = externals/miniz
 	url = https://github.com/richgel999/miniz
-[submodule "externals/cpp-httplib"]
-	path = externals/cpp-httplib
-	url = https://github.com/yhirose/cpp-httplib
 [submodule "externals/aacdec/fdk-aac"]
 	path = externals/aacdec/fdk-aac
 	url = https://android.googlesource.com/platform/external/aac
@@ -136,9 +120,6 @@
 [submodule "externals/openal-soft"]
 	path = externals/openal-soft
 	url = https://github.com/shadexternals/openal-soft.git
-[submodule "externals/sdl3_image"]
-	path = externals/sdl3_image
-	url = https://github.com/libsdl-org/SDL_image
 [submodule "externals/libusb"]
 	path = externals/libusb
 	url = https://github.com/shadexternals/libusb.git
@@ -150,7 +131,9 @@
 [submodule "externals/ImGuiFileDialog"]
 	path = externals/ImGuiFileDialog
 	url = https://github.com/shadexternals/ImGuiFileDialog.git
-	branch = shadps4
+[submodule "externals/spdlog"]
+	path = externals/spdlog
+	url = https://github.com/gabime/spdlog.git
 	shallow = true
 	branch = v2.x
 [submodule "externals/libressl"]
@@ -170,11 +153,16 @@
 [submodule "externals/protobuf"]
 	path = externals/protobuf
 	url = https://github.com/shadexternals/protobuf.git
-[submodule "externals/zarchive"]
-	path = externals/zarchive
-	url = https://github.com/Exzap/ZArchive.git
-	shallow = true
 [submodule "externals/zstd"]
 	path = externals/zstd
-	url = https://github.com/facebook/zstd.git
-	shallow = true
+	url = https://github.com/shadexternals/zstd.git
+[submodule "externals/zarchive"]
+	path = externals/zarchive
+	url = https://github.com/shadexternals/ZArchive.git
+[submodule "externals/abseil-cpp"]
+	path = externals/abseil-cpp
+	url = https://github.com/abseil/abseil-cpp.git
+[submodule "externals/imgui"]
+	path = externals/imgui
+	url = https://github.com/shadexternals/imgui.git
+	branch = docking

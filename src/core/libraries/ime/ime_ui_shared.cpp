@@ -7,7 +7,6 @@
 #include <cstring>
 #include <numbers>
 
-#include "common/config.h"
 #include "common/singleton.h"
 #include "input/controller.h"
 
@@ -87,11 +86,8 @@ bool ReadControllerState(Libraries::UserService::OrbisUserServiceUserId user_id,
         if (has_state) {
             *has_state = false;
         }
-        Input::State pad_state{};
-        bool connected = false;
-        int connected_count = 0;
-        (*controllers)[index]->ReadState(&pad_state, &connected, &connected_count);
-        if (!connected) {
+        Input::State pad_state = (*controllers)[index]->ReadState();
+        if (!pad_state.connected) {
             return false;
         }
         if (has_state) {
@@ -101,7 +97,7 @@ bool ReadControllerState(Libraries::UserService::OrbisUserServiceUserId user_id,
         return true;
     };
 
-    const auto mapped = GamepadSelect::GetControllerIndexFromUserID(user_id);
+    const auto mapped = Input::GameControllers::GetControllerIndexFromUserID(user_id);
     if (mapped.has_value() && *mapped < 5) {
         bool has_state = false;
         if (read_state(*mapped, &has_state) && has_state) {
@@ -587,19 +583,10 @@ VirtualPadSnapshot ReadVirtualPadSnapshot(Libraries::UserService::OrbisUserServi
         merge_imgui_button(ImGuiKey_GamepadDpadRight, kMaskRight);
         merge_imgui_button(ImGuiKey_GamepadDpadUp, kMaskUp);
         merge_imgui_button(ImGuiKey_GamepadDpadDown, kMaskDown);
-
-        // Apply X to Circle swap if configured
-        const bool swap_x_circle = Config::getXCircleButtonSwap();
-        if (swap_x_circle) {
-            merge_imgui_button(ImGuiKey_GamepadFaceDown, kMaskCircle);
-            merge_imgui_button(ImGuiKey_GamepadFaceRight, kMaskCross);
-        } else {
-            merge_imgui_button(ImGuiKey_GamepadFaceDown, kMaskCross);
-            merge_imgui_button(ImGuiKey_GamepadFaceRight, kMaskCircle);
-        }
-
+        merge_imgui_button(ImGuiKey_GamepadFaceDown, kMaskCross);
         merge_imgui_button(ImGuiKey_GamepadFaceUp, kMaskTriangle);
         merge_imgui_button(ImGuiKey_GamepadFaceLeft, kMaskSquare);
+        merge_imgui_button(ImGuiKey_GamepadFaceRight, kMaskCircle);
         merge_imgui_button(ImGuiKey_GamepadL1, kMaskL1);
         merge_imgui_button(ImGuiKey_GamepadR1, kMaskR1);
         merge_imgui_button(ImGuiKey_GamepadL3, kMaskL3);

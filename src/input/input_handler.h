@@ -23,7 +23,6 @@
 #define SDL_MOUSE_WHEEL_DOWN SDL_EVENT_MOUSE_WHEEL + 4
 #define SDL_MOUSE_WHEEL_LEFT SDL_EVENT_MOUSE_WHEEL + 5
 #define SDL_MOUSE_WHEEL_RIGHT SDL_EVENT_MOUSE_WHEEL + 7
-#define SDL_DUAL_MOUSE_BUTTONS SDL_EVENT_MOUSE_WHEEL + 8
 
 #define SDL_GAMEPAD_BUTTON_TOUCHPAD_LEFT SDL_GAMEPAD_BUTTON_COUNT + 1
 #define SDL_GAMEPAD_BUTTON_TOUCHPAD_CENTER SDL_GAMEPAD_BUTTON_COUNT + 2
@@ -42,9 +41,8 @@
 #define SDL_EVENT_ADD_VIRTUAL_USER SDL_EVENT_USER + 11
 #define SDL_EVENT_REMOVE_VIRTUAL_USER SDL_EVENT_USER + 12
 #define SDL_EVENT_RDOC_CAPTURE SDL_EVENT_USER + 13
-#define SDL_EVENT_KILL_EMULATOR SDL_EVENT_USER + 14
-#define SDL_EVENT_SCREENSHOT SDL_EVENT_USER + 15
-#define SDL_EVENT_SCREENSHOT_WITH_OVERLAYS SDL_EVENT_USER + 16
+#define SDL_EVENT_SCREENSHOT_WITH_OVERLAYS SDL_EVENT_USER + 14
+#define SDL_EVENT_TOGGLE_FRIENDS SDL_EVENT_USER + 15
 
 #define LEFTJOYSTICK_HALFMODE 0x00010000
 #define RIGHTJOYSTICK_HALFMODE 0x00020000
@@ -52,6 +50,9 @@
 
 #define KEY_TOGGLE 0x00200000
 #define MOUSE_GYRO_ROLL_MODE 0x00400000
+#define MOTION_TILT_LEFT 0x00800000
+#define MOTION_TILT_RIGHT 0x01000000
+#define MOTION_SHAKE 0x02000000
 
 #define HOTKEY_FULLSCREEN 0xf0000001
 #define HOTKEY_PAUSE 0xf0000002
@@ -66,9 +67,9 @@
 #define HOTKEY_VOLUME_DOWN 0xf000000b
 #define HOTKEY_ADD_VIRTUAL_USER 0xf000000c
 #define HOTKEY_REMOVE_VIRTUAL_USER 0xf000000d
-#define HOTKEY_VOLUME_MUTE 0xf000000e
-#define HOTKEY_SCREENSHOT 0xf000000f
-#define HOTKEY_SCREENSHOT_WITH_OVERLAYS 0xf0000010
+#define HOTKEY_SCREENSHOT_WITH_OVERLAYS 0xf000000e
+#define HOTKEY_OPEN_EMULATOR_SETTINGS 0xf000000f
+#define HOTKEY_TOGGLE_FRIENDS 0xf0000010
 
 #define SDL_UNMAPPED UINT32_MAX - 1
 
@@ -144,12 +145,13 @@ const std::map<std::string, u32> string_to_cbutton_map = {
     {"touchpad_right", SDL_GAMEPAD_BUTTON_TOUCHPAD_RIGHT},
     {"leftjoystick_halfmode", LEFTJOYSTICK_HALFMODE},
     {"rightjoystick_halfmode", RIGHTJOYSTICK_HALFMODE},
+    {"motion_tilt_left", MOTION_TILT_LEFT},
+    {"motion_tilt_right", MOTION_TILT_RIGHT},
+    {"motion_shake", MOTION_SHAKE},
 
     // this is only for input
     {"back", SDL_GAMEPAD_BUTTON_BACK},
     {"share", SDL_GAMEPAD_BUTTON_BACK},
-    {"home", SDL_GAMEPAD_BUTTON_GUIDE},
-
     {"lpaddle_high", SDL_GAMEPAD_BUTTON_LEFT_PADDLE1},
     {"lpaddle_low", SDL_GAMEPAD_BUTTON_LEFT_PADDLE2},
     {"rpaddle_high", SDL_GAMEPAD_BUTTON_RIGHT_PADDLE1},
@@ -172,13 +174,13 @@ const std::map<std::string, u32> string_to_hotkey_map = {
     {"hotkey_toggle_mouse_to_touchpad", HOTKEY_TOGGLE_MOUSE_TO_TOUCHPAD},
     {"hotkey_capture_frame", HOTKEY_RENDERDOC},
     {"hotkey_screenshot_with_overlays", HOTKEY_SCREENSHOT_WITH_OVERLAYS},
+    {"hotkey_renderdoc_capture", HOTKEY_RENDERDOC},
     {"hotkey_add_virtual_user", HOTKEY_ADD_VIRTUAL_USER},
     {"hotkey_remove_virtual_user", HOTKEY_REMOVE_VIRTUAL_USER},
-    {"hotkey_kill_emulator", SDL_EVENT_KILL_EMULATOR},
-    {"hotkey_screenshot", HOTKEY_SCREENSHOT},
     {"hotkey_volume_up", HOTKEY_VOLUME_UP},
     {"hotkey_volume_down", HOTKEY_VOLUME_DOWN},
-    {"hotkey_volume_mute", HOTKEY_VOLUME_MUTE},
+    {"hotkey_emulator_settings", HOTKEY_OPEN_EMULATOR_SETTINGS},
+    {"hotkey_toggle_friends", HOTKEY_TOGGLE_FRIENDS},
 };
 
 const std::map<std::string, AxisMapping> string_to_axis_map = {
@@ -398,7 +400,7 @@ public:
                 keys[2] = k2;
             } else {
                 keys[1] = k2;
-                keys[3] = k1;
+                keys[2] = k1;
             }
         }
     }
@@ -544,7 +546,7 @@ public:
 
 class ControllerAllOutputs {
 public:
-    static constexpr u64 output_count = 44;
+    static constexpr u64 output_count = 46;
     std::array<ControllerOutput, output_count> data = {
         // Important: these have to be the first, or else they will update in the wrong order
         ControllerOutput(LEFTJOYSTICK_HALFMODE),
@@ -569,6 +571,11 @@ public:
         ControllerOutput(SDL_GAMEPAD_BUTTON_DPAD_DOWN),       // Down
         ControllerOutput(SDL_GAMEPAD_BUTTON_DPAD_LEFT),       // Left
         ControllerOutput(SDL_GAMEPAD_BUTTON_DPAD_RIGHT),      // Right
+
+        // Motion emulation
+        ControllerOutput(MOTION_TILT_LEFT),
+        ControllerOutput(MOTION_TILT_RIGHT),
+        ControllerOutput(MOTION_SHAKE),
 
         // Axis mappings
         // ControllerOutput(SDL_GAMEPAD_BUTTON_INVALID, SDL_GAMEPAD_AXIS_LEFTX, false),
@@ -595,11 +602,10 @@ public:
         ControllerOutput(HOTKEY_SCREENSHOT_WITH_OVERLAYS),
         ControllerOutput(HOTKEY_ADD_VIRTUAL_USER),
         ControllerOutput(HOTKEY_REMOVE_VIRTUAL_USER),
-        ControllerOutput(HOTKEY_SCREENSHOT),
         ControllerOutput(HOTKEY_VOLUME_UP),
         ControllerOutput(HOTKEY_VOLUME_DOWN),
-        ControllerOutput(HOTKEY_VOLUME_MUTE),
-        ControllerOutput(SDL_EVENT_KILL_EMULATOR),
+        ControllerOutput(HOTKEY_OPEN_EMULATOR_SETTINGS),
+        ControllerOutput(HOTKEY_TOGGLE_FRIENDS),
 
         ControllerOutput(SDL_GAMEPAD_BUTTON_INVALID, SDL_GAMEPAD_AXIS_INVALID),
     };
@@ -610,22 +616,10 @@ public:
     }
 };
 
-enum HotkeyPad { FullscreenPad, PausePad, SimpleFpsPad, QuitPad, DebugMenuPad };
-
-enum class HotkeyInputType {
-    Any,       // current behavior
-    Keyboard,  // only check if user defined a keyboard binding
-    Controller // only check if user defined a controller binding
-};
-
 // Updates the list of pressed keys with the given input.
 // Returns whether the list was updated or not.
 bool UpdatePressedKeys(InputEvent event);
 
 void ActivateOutputsFromInputs();
-bool HasUserHotkeyDefined(int controller_index, HotkeyPad pad, HotkeyInputType type);
-bool ControllerComboPressedOnce(u8 gamepad_id, Libraries::Pad::OrbisPadButtonDataOffset holdButton,
-                                Libraries::Pad::OrbisPadButtonDataOffset pressButton);
-bool ControllerPressedOnce(u8 gamepad_id,
-                           std::initializer_list<Libraries::Pad::OrbisPadButtonDataOffset> buttons);
+
 } // namespace Input

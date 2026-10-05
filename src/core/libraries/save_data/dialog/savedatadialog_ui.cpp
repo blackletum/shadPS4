@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <fmt/chrono.h>
@@ -8,7 +8,6 @@
 #include "common/elf_info.h"
 #include "common/singleton.h"
 #include "common/string_util.h"
-#include "common/zar_fs.h"
 #include "core/file_format/psf.h"
 #include "core/file_sys/fs.h"
 #include "core/libraries/save_data/save_instance.h"
@@ -139,9 +138,8 @@ SaveDialogState::SaveDialogState(const OrbisSaveDataDialogParam& param) {
             auto buf = (u8*)new_item->iconBuf;
             icon = RefCountedTexture::DecodePngTexture({buf, buf + new_item->iconSize});
         } else {
-            const auto& src_icon = g_mnt->GetHostPath("/app0/sce_sys/save_data.png");
-            if (Common::FS::Zar::Exists(src_icon)) {
-                icon = RefCountedTexture::DecodePngFile(src_icon);
+            if (auto bytes = g_mnt->ReadFile("/app0/sce_sys/save_data.png")) {
+                icon = RefCountedTexture::DecodePngTexture(std::move(*bytes));
             }
         }
         if (new_item->title != nullptr) {

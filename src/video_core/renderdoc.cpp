@@ -1,8 +1,9 @@
-// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/assert.h"
-#include "common/config.h"
+#include "common/logging/formatter.h"
+#include "core/emulator_settings.h"
 #include "video_core/renderdoc.h"
 
 #include <atomic>
@@ -17,26 +18,6 @@
 #include <filesystem>
 
 namespace VideoCore {
-enum class ScreenshotState {
-    Idle,
-    Triggered,
-};
-
-static ScreenshotState screenshot_state{ScreenshotState::Idle};
-
-void TriggerScreenshot() {
-    if (screenshot_state == ScreenshotState::Idle) {
-        screenshot_state = ScreenshotState::Triggered;
-    }
-}
-
-bool ConsumeScreenshotRequest() {
-    if (screenshot_state == ScreenshotState::Triggered) {
-        screenshot_state = ScreenshotState::Idle;
-        return true;
-    }
-    return false;
-}
 
 enum class CaptureState {
     Idle,
@@ -54,7 +35,7 @@ void LoadRenderDoc() {
 
     // Check if we are running by RDoc GUI
     HMODULE mod = GetModuleHandleA("renderdoc.dll");
-    if (!mod && Config::isRdocEnabled()) {
+    if (!mod && EmulatorSettings.IsRenderdocEnabled()) {
         // If enabled in config, try to load RDoc runtime in offline mode
         HKEY h_reg_key;
         LONG result = RegOpenKeyExW(HKEY_LOCAL_MACHINE,
@@ -90,7 +71,7 @@ void LoadRenderDoc() {
 #endif
     // Check if we are running by RDoc GUI
     void* mod = dlopen(RENDERDOC_LIB, RTLD_NOW | RTLD_NOLOAD);
-    if (!mod && Config::isRdocEnabled()) {
+    if (!mod && EmulatorSettings.IsRenderdocEnabled()) {
         // If enabled in config, try to load RDoc runtime in offline mode
         if ((mod = dlopen(RENDERDOC_LIB, RTLD_NOW))) {
             const auto RENDERDOC_GetAPI =

@@ -4,14 +4,12 @@
 #include "font_internal.h"
 
 #include <array>
-#include <limits>
 
 #include <ft2build.h>
 #include FT_FREETYPE_H
 #include FT_OUTLINE_H
 #include FT_TRUETYPE_TABLES_H
 
-#include "common/io_file.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/font/fontft_internal.h"
 #include "core/libraries/kernel/kernel.h"
@@ -920,24 +918,49 @@ std::filesystem::path ResolveGuestPath(const char* guest_path) {
 
 bool LoadGuestFileBytes(const std::filesystem::path& host_path,
                         std::vector<unsigned char>& out_bytes) {
-    Common::FS::IOFile file(host_path, Common::FS::FileAccessMode::Read);
-    if (!file.IsOpen()) {
+    std::ifstream file(host_path, std::ios::binary | std::ios::ate);
+    if (!file) {
         return false;
     }
-    const u64 size = file.GetSize();
+    const std::streamoff size = file.tellg();
+    if (size < 0) {
+        return false;
+    }
     if (size == 0) {
         out_bytes.clear();
         return true;
     }
-    if (size > std::numeric_limits<size_t>::max()) {
+    if (static_cast<std::uint64_t>(size) > std::numeric_limits<std::size_t>::max()) {
         return false;
     }
-    out_bytes.resize(static_cast<size_t>(size));
-    if (file.ReadRaw<unsigned char>(out_bytes.data(), out_bytes.size()) != out_bytes.size()) {
+    out_bytes.resize(static_cast<std::size_t>(size));
+    file.seekg(0, std::ios::beg);
+    if (!file.read(reinterpret_cast<char*>(out_bytes.data()),
+                   static_cast<std::streamsize>(out_bytes.size()))) {
         out_bytes.clear();
         return false;
     }
     return true;
+}
+
+bool LoadGuestPathBytes(const char* guest_path, std::vector<unsigned char>& out_bytes) {
+    if (!guest_path) {
+        return false;
+    }
+    if (guest_path[0] == '/') {
+        if (!g_mnt) {
+            g_mnt = Common::Singleton<Core::FileSys::MntPoints>::Instance();
+        }
+        if (g_mnt) {
+            if (auto bytes = g_mnt->ReadFile(guest_path)) {
+                out_bytes = std::move(*bytes);
+                return true;
+            }
+        }
+        return false;
+    }
+    // Non-guest path: treat as a host path (builtin/system fonts).
+    return LoadGuestFileBytes(std::filesystem::path(guest_path), out_bytes);
 }
 
 FaceMetrics LoadFaceMetrics(FT_Face face) {
@@ -2017,7 +2040,7 @@ static bool DirectoryContainsAnyFontFiles(const std::filesystem::path& dir) {
 }
 
 static std::filesystem::path GetSysFontBaseDirImpl(bool log_errors) {
-    std::filesystem::path base = Config::GetFontsDir();
+    std::filesystem::path base = EmulatorSettings.GetFontsDir();
     std::error_code ec;
     if (base.empty()) {
         if (log_errors) {
@@ -2341,7 +2364,7 @@ std::string ReportSystemFaceRequest(FontState& st, Libraries::Font::OrbisFontHan
     }
     if (!st.system_requested) {
         st.system_requested = true;
-        const auto configured = Config::GetFontsDir();
+        const auto configured = EmulatorSettings.GetFontsDir();
         return fmt::format("SystemFace: handle={} requested internal font but fontsPath ('{}') "
                            "could not be loaded",
                            static_cast<const void*>(handle), configured.string());

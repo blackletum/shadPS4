@@ -1,11 +1,11 @@
-// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
 #include <limits>
 #include "common/assert.h"
-#include "common/config.h"
 #include "common/logging/log.h"
+#include "core/emulator_settings.h"
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -128,7 +128,6 @@ bool Swapchain::AcquireNextImage() {
 }
 
 bool Swapchain::Present() {
-
     const vk::PresentInfoKHR present_info = {
         .waitSemaphoreCount = 1,
         .pWaitSemaphores = &present_ready[image_index],
@@ -164,7 +163,7 @@ void Swapchain::FindPresentFormat() {
             return format == SURFACE_FORMAT_HDR;
         }) != formats.end();
     // Also make sure that user allowed us to use HDR
-    supports_hdr &= Config::allowHDR();
+    supports_hdr &= EmulatorSettings.IsHdrAllowed();
 
     // If there is a single undefined surface format, the device doesn't care, so we'll just use
     // RGBA sRGB.
@@ -199,7 +198,7 @@ void Swapchain::FindPresentMode() {
         return;
     }
 
-    const auto requested_mode = Config::getPresentMode();
+    const auto requested_mode = EmulatorSettings.GetPresentMode();
     if (requested_mode == "Mailbox") {
         present_mode = vk::PresentModeKHR::eMailbox;
     } else if (requested_mode == "Fifo") {
@@ -208,7 +207,7 @@ void Swapchain::FindPresentMode() {
         present_mode = vk::PresentModeKHR::eImmediate;
     } else {
         LOG_ERROR(Render_Vulkan, "Unknown present mode {}, defaulting to Mailbox.",
-                  Config::getPresentMode());
+                  EmulatorSettings.GetPresentMode());
         present_mode = vk::PresentModeKHR::eMailbox;
     }
 
@@ -219,6 +218,7 @@ void Swapchain::FindPresentMode() {
                     vk::to_string(present_mode), vk::to_string(fallback));
         present_mode = fallback;
     }
+    LOG_INFO(Render_Vulkan, "Present mode: {}", vk::to_string(present_mode));
 }
 
 void Swapchain::SetSurfaceProperties() {

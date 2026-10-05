@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <array>
+#include <atomic>
 #include <bitset>
 #include <climits>
 #include <cstring>
@@ -13,6 +14,7 @@
 #include <unordered_set>
 #include <vector>
 #include <Zydis/Zydis.h>
+#include <fmt/format.h>
 #include <xbyak/xbyak.h>
 #include <xbyak/xbyak_util.h>
 #include "common/alignment.h"
@@ -95,12 +97,12 @@ static bool FilterTcbAccess(const ZydisDecodedOperand* operands) {
     // Patch only 'mov (64-bit register), fs:[0]'
     return src_op.type == ZYDIS_OPERAND_TYPE_MEMORY && src_op.mem.segment == ZYDIS_REGISTER_FS &&
            src_op.mem.base == ZYDIS_REGISTER_NONE && src_op.mem.index == ZYDIS_REGISTER_NONE &&
-           src_op.mem.disp.value == 0 && dst_op.reg.value >= ZYDIS_REGISTER_RAX &&
+           src_op.mem.disp.value < sizeof(Core::Tcb) && dst_op.reg.value >= ZYDIS_REGISTER_RAX &&
            dst_op.reg.value <= ZYDIS_REGISTER_R15;
 }
 
 #if defined(_WIN32)
-static void RetrieveTcbPointer(Xbyak::Reg dst, Xbyak::CodeGenerator& c) {
+static void RetrieveTcbPointer(Xbyak::Reg dst, Xbyak::CodeGenerator& c, ZyanI64 offset) {
     // The following logic is based on the Kernel32.dll asm of TlsGetValue
     static constexpr u32 TlsSlotsOffset = 0x1480;
     static constexpr u32 TlsExpansionSlotsOffset = 0x1780;
@@ -121,6 +123,10 @@ static void RetrieveTcbPointer(Xbyak::Reg dst, Xbyak::CodeGenerator& c) {
         // Load the pointer to our buffer.
         c.mov(dst, qword[dst + tls_index * sizeof(LPVOID)]);
     }
+    if (offset > 0) {
+        // TCB starts with a pointer to self. Dereference this to get the correct data.
+        c.mov(dst, qword[dst + offset]);
+    }
 }
 #endif
 
@@ -129,7 +135,7 @@ static void GenerateTcbAccess(void* /* address */, const ZydisDecodedOperand* op
     const auto dst = ZydisToXbyakRegisterOperand(operands[0]);
 
 #if defined(_WIN32)
-    RetrieveTcbPointer(dst, c);
+    RetrieveTcbPointer(dst, c, operands[1].mem.disp.value);
 #else
     const auto src = ZydisToXbyakMemoryOperand(operands[1]);
 
@@ -153,7 +159,7 @@ static void GenerateTcbCompare(void* /* address */, const ZydisDecodedOperand* o
     c.push(scratch);
 
     // Retrieve value from TCB and store it in the scratch register
-    RetrieveTcbPointer(scratch, c);
+    RetrieveTcbPointer(scratch, c, operands[1].mem.disp.value);
 
     // Perform compare op
     c.cmp(dst, scratch);
@@ -185,7 +191,7 @@ static void GenerateTcbExclusiveOr(void* /* address */, const ZydisDecodedOperan
     c.push(scratch);
 
     // Retrieve value from TCB and store it in the scratch register
-    RetrieveTcbPointer(scratch, c);
+    RetrieveTcbPointer(scratch, c, operands[1].mem.disp.value);
 
     // Perform xor
     c.xor_(dst, scratch);
@@ -201,30 +207,6 @@ static void GenerateTcbExclusiveOr(void* /* address */, const ZydisDecodedOperan
     c.putSeg(gs);
     c.xor_(dst, src);
 #endif
-}
-
-static bool FilterStackCheck(const ZydisDecodedOperand* operands) {
-    const auto& dst_op = operands[0];
-    const auto& src_op = operands[1];
-
-    // Some compilers emit stack checks by starting a function with
-    // 'mov (64-bit register), fs:[0x28]', then checking with `xor (64-bit register), fs:[0x28]`
-    return src_op.type == ZYDIS_OPERAND_TYPE_MEMORY && src_op.mem.segment == ZYDIS_REGISTER_FS &&
-           src_op.mem.base == ZYDIS_REGISTER_NONE && src_op.mem.index == ZYDIS_REGISTER_NONE &&
-           src_op.mem.disp.value == 0x28 && dst_op.reg.value >= ZYDIS_REGISTER_RAX &&
-           dst_op.reg.value <= ZYDIS_REGISTER_R15;
-}
-
-static void GenerateStackCheck(void* /* address */, const ZydisDecodedOperand* operands,
-                               Xbyak::CodeGenerator& c) {
-    const auto dst = ZydisToXbyakRegisterOperand(operands[0]);
-    c.xor_(dst, 0);
-}
-
-static void GenerateStackCanary(void* /* address */, const ZydisDecodedOperand* operands,
-                                Xbyak::CodeGenerator& c) {
-    const auto dst = ZydisToXbyakRegisterOperand(operands[0]);
-    c.mov(dst, 0);
 }
 
 static bool FilterNoSSE4a(const ZydisDecodedOperand*) {
@@ -546,7 +528,6 @@ struct PatchInfo {
 };
 
 constexpr size_t NearJumpSize = 5;
-constexpr size_t ShortJumpSize = 2;
 
 #if defined(_WIN32)
 static const bool need_tcb_trampoline = true;
@@ -564,14 +545,8 @@ static const std::unordered_map<ZydisMnemonic, std::vector<PatchInfo>> Patches =
 #if !defined(__APPLE__)
     // FS segment patches
     // For most of these, Windows needs a trampoline while other platforms do not.
-    {ZYDIS_MNEMONIC_XOR,
-     // This is for stack checks emitted as xor reg, fs:[0x28]
-     {{FilterStackCheck, GenerateStackCheck, false},
-      {FilterTcbAccess, GenerateTcbExclusiveOr, need_tcb_trampoline}}},
-    {ZYDIS_MNEMONIC_MOV,
-     // This is for getting the stack canary, emitted as mov reg, fs:[0x28]
-     {{FilterStackCheck, GenerateStackCanary, false},
-      {FilterTcbAccess, GenerateTcbAccess, need_tcb_trampoline}}},
+    {ZYDIS_MNEMONIC_XOR, {{FilterTcbAccess, GenerateTcbExclusiveOr, need_tcb_trampoline}}},
+    {ZYDIS_MNEMONIC_MOV, {{FilterTcbAccess, GenerateTcbAccess, need_tcb_trampoline}}},
     {ZYDIS_MNEMONIC_CMP, {{FilterTcbAccess, GenerateTcbCompare, need_tcb_trampoline}}}
 #endif
 };
@@ -597,6 +572,9 @@ struct PatchModule {
     /// Code generator for writing trampoline patches.
     Xbyak::CodeGenerator trampoline_gen;
 
+    /// Prevents repeated generation attempts after the fixed trampoline area is exhausted.
+    bool trampoline_exhausted{};
+
     PatchModule(u8* module_ptr, const u64 module_size, u8* trampoline_ptr,
                 const u64 trampoline_size)
         : start(module_ptr), end(module_ptr + module_size), patch_gen(module_size, module_ptr),
@@ -604,14 +582,31 @@ struct PatchModule {
 };
 static std::map<u64, PatchModule> modules;
 
+static bool HandleTrampolineError(PatchModule* module, const Xbyak::Error& error) {
+    if (static_cast<int>(error) != Xbyak::ERR_CODE_IS_TOO_BIG) {
+        return false;
+    }
+    if (!module->trampoline_exhausted) {
+        LOG_WARNING(Core, "Patch trampoline space exhausted for module at {}",
+                    fmt::ptr(module->start));
+        module->trampoline_exhausted = true;
+    }
+    return true;
+}
+
 static PatchModule* GetModule(const void* ptr) {
-    const auto* address = static_cast<const u8*>(ptr);
-    auto upper_bound = modules.upper_bound(reinterpret_cast<u64>(address));
+    auto upper_bound = modules.upper_bound(reinterpret_cast<u64>(ptr));
     if (upper_bound == modules.begin()) {
         return nullptr;
     }
-    auto& module = std::prev(upper_bound)->second;
-    return address < module.end ? &module : nullptr;
+    return &(std::prev(upper_bound)->second);
+}
+
+// Windows static guest red-zone protection
+static PatchModule* GetContainingModule(const void* ptr) {
+    auto* module = GetModule(ptr);
+    const auto* address = static_cast<const u8*>(ptr);
+    return module != nullptr && address < module->end ? module : nullptr;
 }
 
 /// Returns a boolean indicating whether the instruction was patched, and the offset to advance past
@@ -639,18 +634,30 @@ static std::pair<bool, u64> TryPatch(u8* code, PatchModule* module) {
                     return std::make_pair(false, instruction.length);
                 }
 
+                if (needs_trampoline && module->trampoline_exhausted) {
+                    return std::make_pair(false, instruction.length);
+                }
+
                 // Reset state and move to current code position.
                 patch_gen.reset();
                 patch_gen.setSize(code - patch_gen.getCode());
 
                 if (needs_trampoline) {
                     auto& trampoline_gen = module->trampoline_gen;
+                    const size_t trampoline_offset = trampoline_gen.getSize();
                     const auto trampoline_ptr = trampoline_gen.getCurr();
+                    try {
+                        patch_info.generator(code, operands, trampoline_gen);
 
-                    patch_info.generator(code, operands, trampoline_gen);
-
-                    // Return to the following instruction at the end of the trampoline.
-                    trampoline_gen.jmp(code + instruction.length);
+                        // Return to the following instruction at the end of the trampoline.
+                        trampoline_gen.jmp(code + instruction.length);
+                    } catch (const Xbyak::Error& error) {
+                        trampoline_gen.setSize(trampoline_offset);
+                        if (HandleTrampolineError(module, error)) {
+                            return std::make_pair(false, instruction.length);
+                        }
+                        throw;
+                    }
 
                     // Replace instruction with near jump to the trampoline.
                     patch_gen.jmp(trampoline_ptr, Xbyak::CodeGenerator::LabelType::T_NEAR);
@@ -912,11 +919,38 @@ static void TryPatchAot(void* code_address, u64 code_size) {
     }
 }
 
-#if defined(_WIN32)
+// ============================================================================
+// Windows static guest red-zone protection
+// ============================================================================
+
+namespace WindowsGuestRedZoneProtection {
+namespace {
+
+std::atomic active_mode{WindowsGuestRedZoneProtectionMode::Disabled};
+
+} // namespace
+
+void SetActiveMode(WindowsGuestRedZoneProtectionMode mode) noexcept {
+    active_mode.store(mode, std::memory_order_release);
+}
+
+WindowsGuestRedZoneProtectionMode GetActiveMode() noexcept {
+    return active_mode.load(std::memory_order_acquire);
+}
+
+bool IsStaticPatchingEnabled() noexcept {
+    return GetActiveMode() == WindowsGuestRedZoneProtectionMode::StaticPatching;
+}
+
+} // namespace WindowsGuestRedZoneProtection
+
+// macOS shares the function decoder and relocator to apply its CPU patches ahead of time.
+#if defined(_WIN32) || defined(__APPLE__)
 
 namespace {
 
 constexpr size_t GuestRedZoneSize = 128;
+constexpr size_t ShortJumpSize = 2;
 using RedZoneMask = std::bitset<GuestRedZoneSize>;
 
 struct DecodedCodeInstruction {
@@ -1563,10 +1597,17 @@ const PatchInfo* FindMatchingPatch(const DecodedCodeInstruction& decoded) {
 
 } // namespace
 
-RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_size,
-                                                  std::span<const uintptr_t> function_starts) {
+using AddressRanges = std::vector<std::pair<uintptr_t, uintptr_t>>;
+
+/// Applies the CPU patches to every function of the segment. If red_zone_protection is true,
+/// the red-zone accesses of those functions are protected as well. If covered_ranges is not
+/// null, it receives the sorted address ranges of the decoded instructions.
+static RedZonePatchResult PatchSegmentStatically(u64 segment_addr, u64 segment_size,
+                                                 std::span<const uintptr_t> function_starts,
+                                                 bool red_zone_protection,
+                                                 AddressRanges* covered_ranges) {
     RedZonePatchResult result{};
-    auto* module = GetModule(reinterpret_cast<void*>(segment_addr));
+    auto* module = GetContainingModule(reinterpret_cast<void*>(segment_addr));
     if (module == nullptr || function_starts.empty()) {
         return result;
     }
@@ -1594,8 +1635,21 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_
 
         ++result.function_count;
         auto function = DecodeFunction(function_start, function_end, segment_addr, segment_end);
-        AnalyzeRedZoneLiveness(function);
+        if (red_zone_protection) {
+            AnalyzeRedZoneLiveness(function);
+        }
         result.instruction_count += function.instructions.size();
+        if (covered_ranges != nullptr) {
+            // Functions and their instructions are visited in address order.
+            for (const auto& [address, decoded] : function.instructions) {
+                const uintptr_t end = address + decoded.instruction.length;
+                if (!covered_ranges->empty() && address <= covered_ranges->back().second) {
+                    covered_ranges->back().second = std::max(covered_ranges->back().second, end);
+                } else {
+                    covered_ranges->emplace_back(address, end);
+                }
+            }
+        }
 
         std::map<uintptr_t, InstructionRewrite> rewrite_sites;
 
@@ -1605,6 +1659,7 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_
         for (auto& [address, decoded] : function.instructions) {
             const PatchInfo* matching_patch = FindMatchingPatch(decoded);
             const auto [patched, _] = TryPatch(reinterpret_cast<u8*>(address), module);
+            result.inplace_cpu_patch_instruction_count += patched;
             if (IsInPlaceMemoryPatch(decoded.instruction.mnemonic)) {
                 const RedZoneMask red_zone_live = decoded.red_zone_live;
                 decoded = DecodeCodeInstruction(address, function_end);
@@ -1612,14 +1667,13 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_
             } else if (patched) {
                 decoded = DecodeCodeInstruction(address, function_end);
                 decoded.accesses_memory = false;
-            } else if (matching_patch != nullptr && matching_patch->trampoline &&
-                       decoded.instruction.length < NearJumpSize) {
+            } else if (matching_patch != nullptr && matching_patch->trampoline) {
                 rewrite_sites.emplace(address, InstructionRewrite{.cpu_patch = matching_patch});
                 ++result.cpu_patch_instruction_count;
             }
         }
 
-        if (function.uses_red_zone) {
+        if (red_zone_protection && function.uses_red_zone) {
             ++result.red_zone_function_count;
             result.indirect_red_zone_function_count += function.has_indirect_branch;
             for (const auto& [address, decoded] : function.instructions) {
@@ -1667,34 +1721,46 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_
 
         const auto emit_span = [&](const RelocationSpan& span) -> std::optional<size_t> {
             const size_t trampoline_offset = module->trampoline_gen.getSize();
-            for (const auto* decoded : span.instructions) {
-                const auto rewrite = rewrite_sites.find(decoded->address);
-                const bool protected_indirect_call =
-                    rewrite != rewrite_sites.end() && rewrite->second.protected_indirect_call;
-                const bool protect_red_zone = rewrite != rewrite_sites.end() &&
-                                              rewrite->second.protect_red_zone &&
-                                              !protected_indirect_call;
-                if (protect_red_zone) {
-                    module->trampoline_gen.lea(rsp, ptr[rsp - GuestRedZoneSize]);
-                }
-                if (protected_indirect_call) {
-                    if (!GenerateProtectedIndirectCall(*decoded, module->trampoline_gen)) {
+            if (module->trampoline_exhausted) {
+                return std::nullopt;
+            }
+            try {
+                for (const auto* decoded : span.instructions) {
+                    const auto rewrite = rewrite_sites.find(decoded->address);
+                    const bool protected_indirect_call =
+                        rewrite != rewrite_sites.end() && rewrite->second.protected_indirect_call;
+                    const bool protect_red_zone = rewrite != rewrite_sites.end() &&
+                                                  rewrite->second.protect_red_zone &&
+                                                  !protected_indirect_call;
+                    if (protect_red_zone) {
+                        module->trampoline_gen.lea(rsp, ptr[rsp - GuestRedZoneSize]);
+                    }
+                    if (protected_indirect_call) {
+                        if (!GenerateProtectedIndirectCall(*decoded, module->trampoline_gen)) {
+                            module->trampoline_gen.setSize(trampoline_offset);
+                            return std::nullopt;
+                        }
+                    } else if (rewrite != rewrite_sites.end() &&
+                               rewrite->second.cpu_patch != nullptr) {
+                        rewrite->second.cpu_patch->generator(
+                            reinterpret_cast<void*>(decoded->address), decoded->operands.data(),
+                            module->trampoline_gen);
+                    } else if (!EncodeRelocatedInstruction(*decoded, module->trampoline_gen)) {
                         module->trampoline_gen.setSize(trampoline_offset);
                         return std::nullopt;
                     }
-                } else if (rewrite != rewrite_sites.end() && rewrite->second.cpu_patch != nullptr) {
-                    rewrite->second.cpu_patch->generator(reinterpret_cast<void*>(decoded->address),
-                                                         decoded->operands.data(),
-                                                         module->trampoline_gen);
-                } else if (!EncodeRelocatedInstruction(*decoded, module->trampoline_gen)) {
-                    module->trampoline_gen.setSize(trampoline_offset);
+                    if (protect_red_zone && !decoded->replaces_stack_pointer) {
+                        module->trampoline_gen.lea(rsp, ptr[rsp + GuestRedZoneSize]);
+                    }
+                }
+                module->trampoline_gen.jmp(reinterpret_cast<void*>(span.continuation));
+            } catch (const Xbyak::Error& error) {
+                module->trampoline_gen.setSize(trampoline_offset);
+                if (HandleTrampolineError(module, error)) {
                     return std::nullopt;
                 }
-                if (protect_red_zone && !decoded->replaces_stack_pointer) {
-                    module->trampoline_gen.lea(rsp, ptr[rsp + GuestRedZoneSize]);
-                }
+                throw;
             }
-            module->trampoline_gen.jmp(reinterpret_cast<void*>(span.continuation));
             return trampoline_offset;
         };
 
@@ -1781,13 +1847,18 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_
 
             std::optional<RelocationSpan> selected_span;
             std::optional<size_t> trampoline_offset;
-            if (auto forward_span = collect_forward_span()) {
-                trampoline_offset = emit_span(*forward_span);
-                if (trampoline_offset) {
-                    selected_span = std::move(forward_span);
+            const auto& site_instruction = function.instructions.at(site);
+            const bool can_relocate_neighbors = !function.has_indirect_branch;
+            if (can_relocate_neighbors || site_instruction.instruction.length >= NearJumpSize) {
+                auto forward_span = collect_forward_span();
+                if (forward_span) {
+                    trampoline_offset = emit_span(*forward_span);
+                    if (trampoline_offset) {
+                        selected_span = std::move(forward_span);
+                    }
                 }
             }
-            if (!selected_span) {
+            if (!selected_span && can_relocate_neighbors) {
                 if (auto backward_span = collect_backward_span()) {
                     trampoline_offset = emit_span(*backward_span);
                     if (trampoline_offset) {
@@ -2068,13 +2139,93 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_
     return result;
 }
 
+/// Returns the start of the SSE4a instruction whose opcode is at the given address, or null if
+/// the bytes before it are not the prefixes of one.
+static u8* FindSSE4aInstructionStart(u8* opcode, const u8* lower_bound) {
+    if (opcode[0] != 0x0F || (opcode[1] != 0x78 && opcode[1] != 0x79 && opcode[1] != 0x2B)) {
+        return nullptr;
+    }
+    u8* start = opcode - 1;
+    if (start >= lower_bound && (*start & 0xF0) == 0x40) {
+        // REX prefix
+        --start;
+    }
+    if (start < lower_bound || (*start != 0x66 && *start != 0xF2 && *start != 0xF3)) {
+        return nullptr;
+    }
+    return start;
+}
+
+/// Patches the SSE4a instructions between covered_ranges in place, without relocating any.
+/// The bytes after the last range are skipped, as they hold read-only data.
+static void PatchUncoveredSSE4aInstructions(u64 segment_addr, const AddressRanges& covered_ranges,
+                                            RedZonePatchResult& result) {
+    auto* module = GetContainingModule(reinterpret_cast<void*>(segment_addr));
+    if (module == nullptr) {
+        return;
+    }
+    std::unique_lock lock{module->mutex};
+
+    const auto patch_gap = [&](uintptr_t gap_start, uintptr_t gap_end) {
+        auto* const lower_bound = reinterpret_cast<u8*>(gap_start);
+        for (uintptr_t address = gap_start; address + 2 <= gap_end; ++address) {
+            u8* const start =
+                FindSSE4aInstructionStart(reinterpret_cast<u8*>(address), lower_bound);
+            if (start == nullptr) {
+                continue;
+            }
+            const auto decoded = DecodeCodeInstruction(reinterpret_cast<uintptr_t>(start), gap_end);
+            if (decoded.instruction.length == 0 || FindMatchingPatch(decoded) == nullptr) {
+                continue;
+            }
+            if (TryPatch(start, module).first) {
+                ++result.uncovered_inplace_cpu_patch_instruction_count;
+            } else if (!IsInPlaceMemoryPatch(decoded.instruction.mnemonic)) {
+                ++result.uncovered_unsupported_cpu_patch_instruction_count;
+            }
+            address = decoded.address + decoded.instruction.length - 1;
+        }
+    };
+
+    uintptr_t cursor = segment_addr;
+    for (const auto& [range_start, range_end] : covered_ranges) {
+        if (range_start > cursor) {
+            patch_gap(cursor, range_start);
+        }
+        cursor = std::max(cursor, range_end);
+    }
+}
+
+RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_size,
+                                                  std::span<const uintptr_t> function_starts) {
+    return PatchSegmentStatically(segment_addr, segment_size, function_starts, true, nullptr);
+}
+
+RedZonePatchResult PatchCpuInstructionsStatically(u64 segment_addr, u64 segment_size,
+                                                  std::span<const uintptr_t> function_starts) {
+    AddressRanges covered_ranges;
+    auto result =
+        PatchSegmentStatically(segment_addr, segment_size, function_starts, false, &covered_ranges);
+    // The EH frame search table does not list every function of every module.
+    PatchUncoveredSSE4aInstructions(segment_addr, covered_ranges, result);
+    return result;
+}
+
 #else
 
 RedZonePatchResult PatchRedZoneMemoryInstructions(u64, u64, std::span<const uintptr_t>) {
     return {};
 }
 
+RedZonePatchResult PatchCpuInstructionsStatically(u64, u64, std::span<const uintptr_t>) {
+    return {};
+}
+
 #endif
+
+// ============================================================================
+// End Windows static guest red-zone protection
+// ============================================================================
 
 static bool PatchesAccessViolationHandler(void* context, void* /* fault_address */) {
     return TryPatchJit(Common::GetRip(context));
@@ -2082,7 +2233,16 @@ static bool PatchesAccessViolationHandler(void* context, void* /* fault_address 
 
 static bool PatchesIllegalInstructionHandler(void* context) {
     void* code_address = Common::GetRip(context);
-    if (GetModule(code_address) != nullptr && Is4ByteExtrqOrInsertq(code_address)) {
+#if defined(_WIN32)
+    // Windows static guest red-zone protection
+    const bool inspect_short_cpu_patch =
+        !WindowsGuestRedZoneProtection::IsStaticPatchingEnabled() ||
+        GetContainingModule(code_address) != nullptr;
+#else
+    constexpr bool inspect_short_cpu_patch = true;
+#endif
+    if (inspect_short_cpu_patch && // Windows static guest red-zone protection
+        Is4ByteExtrqOrInsertq(code_address)) {
         // The instruction is not big enough for a relative jump, don't try to patch it and pass it
         // to our illegal instruction interpreter directly
         return TryExecuteIllegalInstruction(context, code_address);

@@ -28,11 +28,12 @@ public:
 
     void Open();
     void Close();
+    // Drops everything cached so far, so the cache starts over empty. Call before FinishPreload.
+    void Clear();
     [[nodiscard]] bool IsOpened() const {
         return opened;
     }
     void FinishPreload();
-    void ResetShaderCacheState();
 
     bool Save(BlobType type, const std::string& name, std::vector<u8>&& data);
     bool Save(BlobType type, const std::string& name, std::vector<u32>&& data);

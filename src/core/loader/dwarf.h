@@ -3,7 +3,7 @@
 
 #pragma once
 
-#include <vector>
+#include <vector> // Windows static guest red-zone protection
 
 #include "common/types.h"
 
@@ -28,20 +28,22 @@ enum {
     DW_EH_PE_aligned = 0x50,
     DW_EH_PE_indirect = 0x80,
     DW_EH_PE_omit = 0xFF,
+    // Windows static guest red-zone protection
     DW_EH_PE_format_mask = 0x0F,
     DW_EH_PE_application_mask = 0x70,
 };
 
 /// Information encoded in the EH frame header.
 struct EHHeaderInfo {
-    uintptr_t eh_frame_ptr{};
-    size_t fde_count{};
-    uintptr_t table{};
-    uintptr_t datarel_base{};
-    u8 table_enc{DW_EH_PE_omit};
+    uintptr_t eh_frame_ptr{};    // Windows static guest red-zone protection
+    size_t fde_count{};          // Windows static guest red-zone protection
+    uintptr_t table{};           // Windows static guest red-zone protection
+    uintptr_t datarel_base{};    // Windows static guest red-zone protection
+    u8 table_enc{DW_EH_PE_omit}; // Windows static guest red-zone protection
 };
 
 bool DecodeEHHdr(uintptr_t ehHdrStart, uintptr_t ehHdrEnd, EHHeaderInfo& ehHdrInfo);
+// Windows static guest red-zone protection
 bool DecodeEHHdrTable(const EHHeaderInfo& ehHdrInfo, uintptr_t ehHdrEnd,
                       std::vector<uintptr_t>& functionStarts);
 

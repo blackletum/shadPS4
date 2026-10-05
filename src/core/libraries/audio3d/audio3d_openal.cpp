@@ -11,9 +11,10 @@
 #include <AL/alc.h>
 #include <alext.h>
 #include <efx.h>
+#include <fmt/format.h>
 #include <magic_enum/magic_enum.hpp>
+
 #include "common/assert.h"
-#include "common/config.h"
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/audio/audioout.h"
@@ -315,7 +316,7 @@ static void SpatialUpdateVolumeLocked(Port& port) {
     }
     port.last_volume_check_us = now;
 
-    const float slider_gain = Config::getVolumeSlider() * 0.01f;
+    const float slider_gain = EmulatorSettings.GetVolumeSlider() * 0.01f;
     if (std::abs(slider_gain - port.current_gain) < 0.001f) {
         return;
     }
@@ -376,7 +377,7 @@ static bool EnsureSpatial(Port& port) {
     }
     port.spatial_init_attempted = true;
 
-    port.device_name = Config::getMainOutputDevice();
+    port.device_name = EmulatorSettings.GetOpenALMainOutputDevice();
     auto& device = AudioOut::OpenALDevice::GetInstance();
 
     if (!device.RegisterPort(port.device_name)) {
@@ -429,7 +430,7 @@ static bool EnsureSpatial(Port& port) {
         return false;
     }
 
-    const float slider_gain = Config::getVolumeSlider() * 0.01f;
+    const float slider_gain = EmulatorSettings.GetVolumeSlider() * 0.01f;
     alSourcef(port.bed.source, AL_GAIN, slider_gain);
     port.current_gain = slider_gain;
     if (port.direct_channels_supported) {

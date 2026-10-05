@@ -19,7 +19,7 @@ class TextureCache;
 
 namespace Vulkan {
 
-static constexpr u32 MaxShaderStages = static_cast<u32>(Shader::LogicalStage::NumLogicalStages);
+static constexpr u32 MaxShaderStages = static_cast<u32>(Shader::SwStage::NumLogicalStages);
 static constexpr u32 MaxVertexBufferCount = 32;
 
 class Instance;
@@ -77,6 +77,7 @@ public:
         vk::PipelineMultisampleStateCreateInfo multisampling{};
         std::vector<u32> tcs{};
         std::vector<u32> tes{};
+        std::vector<u32> fragment{};
 
         void Serialize(Serialization::Archive& ar) const;
         bool Deserialize(Serialization::Archive& ar);
@@ -87,12 +88,12 @@ public:
                      vk::PipelineCache pipeline_cache,
                      std::span<const Shader::Info*, MaxShaderStages> stages,
                      std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
-                     std::optional<const Shader::Gcn::FetchShaderData> fetch_shader,
+                     const Shader::Gcn::FetchShaderData* fetch_shader,
                      std::span<const vk::ShaderModule> modules, SerializationSupport& sdata,
-                     bool preloading);
+                     bool preloading, PipelineCompiler* compiler);
     ~GraphicsPipeline();
 
-    const std::optional<const Shader::Gcn::FetchShaderData>& GetFetchShader() const noexcept {
+    const Shader::Gcn::FetchShaderData& GetFetchShader() const noexcept {
         return fetch_shader;
     }
 
@@ -108,11 +109,32 @@ public:
                          u32 step_rate_1) const;
 
 private:
+    /// Everything pipeline compilation needs besides the key, copied so that compiling can
+    /// run on another thread while the pipeline cache moves on.
+    struct CompileInputs {
+        /// Guest shader modules by software stage, null for stages the guest doesn't use.
+        std::array<vk::ShaderModule, MaxShaderStages> modules{};
+        SerializationSupport sdata{};
+        bool aux_tcs{};
+        bool aux_tes{};
+        bool aux_fragment{};
+        std::string debug_str;
+    };
+
     void BuildDescSetLayout(bool preloading);
+    void Compile(const CompileInputs& inputs);
 
 private:
     GraphicsPipelineKey key;
-    std::optional<const Shader::Gcn::FetchShaderData> fetch_shader{};
+    Shader::Gcn::FetchShaderData fetch_shader{};
+};
+
+struct ClipDistanceShaderKey {
+    std::array<std::tuple<u8, u8>, 8> clip_locations;
+
+    bool operator==(const ClipDistanceShaderKey& key) const noexcept {
+        return std::memcmp(this, &key, sizeof(key)) == 0;
+    }
 };
 
 } // namespace Vulkan
@@ -120,6 +142,13 @@ private:
 template <>
 struct std::hash<Vulkan::GraphicsPipelineKey> {
     std::size_t operator()(const Vulkan::GraphicsPipelineKey& key) const noexcept {
+        return XXH3_64bits(&key, sizeof(key));
+    }
+};
+
+template <>
+struct std::hash<Vulkan::ClipDistanceShaderKey> {
+    std::size_t operator()(const Vulkan::ClipDistanceShaderKey& key) const noexcept {
         return XXH3_64bits(&key, sizeof(key));
     }
 };

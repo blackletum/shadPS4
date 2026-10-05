@@ -800,7 +800,7 @@ static Error ComputeImeDialogPanelSizeExtended(const OrbisImeDialogParam* param,
             accessibility = true;
         } else {
             // Emulate system accessibility setting (LLE FUN_01005a50 path).
-            accessibility = Config::IsImeAccessibilityEnabled();
+            accessibility = EmulatorSettings.IsImeAccessibilityEnabled();
         }
     }
 
@@ -829,7 +829,7 @@ static Error ComputeImeDialogPanelSizeExtended(const OrbisImeDialogParam* param,
     auto use_short_url_mail_height = [&](u32 ime_type) {
         // LLE: (SVar1 & ~BASIC_LATIN) == (URL | bVar15), with bVar15 default true.
         // When bVar15 is true, this condition is false for Url/Mail; false enables short heights.
-        const bool bVar15 = !Config::IsImeUrlMailShortPanel();
+        const bool bVar15 = !EmulatorSettings.IsImeUrlMailShortPanel();
         const u32 masked_type = ime_type & ~static_cast<u32>(OrbisImeType::BasicLatin);
         const u32 url_or_mail = static_cast<u32>(OrbisImeType::Url) | (bVar15 ? 1U : 0U);
         return masked_type == url_or_mail;
@@ -949,9 +949,9 @@ Error PS4_SYSV_ABI sceImeDialogGetResult(OrbisImeDialogResult* result) {
 }
 
 OrbisImeDialogStatus PS4_SYSV_ABI sceImeDialogGetStatus() {
-    LOG_INFO(Lib_ImeDialog, "GetStatus called (status={}, client_state={})",
-             static_cast<u32>(g_ime_dlg_status),
-             g_ime_dlg_client ? g_ime_dlg_client->dialog_state : -1);
+    LOG_TRACE(Lib_ImeDialog, "GetStatus called (status={}, client_state={})",
+              static_cast<u32>(g_ime_dlg_status),
+              g_ime_dlg_client ? g_ime_dlg_client->dialog_state : -1);
     if (!g_ime_dlg_client) {
         LOG_DEBUG(Lib_ImeDialog, "GetStatus -> None (no client)");
         return OrbisImeDialogStatus::None;

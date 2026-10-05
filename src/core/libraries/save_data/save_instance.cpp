@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <iostream>
@@ -6,10 +6,8 @@
 #include <magic_enum/magic_enum.hpp>
 
 #include "common/assert.h"
-#include "common/config.h"
 #include "common/path_util.h"
 #include "common/singleton.h"
-#include "common/zar_fs.h"
 #include "core/emulator_settings.h"
 #include "core/file_sys/fs.h"
 #include "save_backup.h"
@@ -24,25 +22,25 @@ static Core::FileSys::MntPoints* g_mnt = Common::Singleton<Core::FileSys::MntPoi
 namespace fs = std::filesystem;
 
 // clang-format off
-static const std::unordered_map<std::string, std::string> default_title = {
-    {"ja_JP", "セーブデータ"},
-    {"en_US", "Saved Data"},
-    {"fr_FR", "Données sauvegardées"},
-    {"es_ES", "Datos guardados"},
-    {"de_DE", "Gespeicherte Daten"},
-    {"it_IT", "Dati salvati"},
-    {"nl_NL", "Opgeslagen data"},
-    {"pt_PT", "Dados guardados"},
-    {"ru_RU", "Сохраненные данные"},
-    {"ko_KR", "저장 데이터"},
-    {"zh_CN", "保存数据"},
-    {"fi_FI", "Tallennetut tiedot"},
-    {"sv_SE", "Sparade data"},
-    {"da_DK", "Gemte data"},
-    {"no_NO", "Lagrede data"},
-    {"pl_PL", "Zapisane dane"},
-    {"pt_BR", "Dados salvos"},
-    {"tr_TR", "Kayıtlı Veriler"},
+static const std::unordered_map<int, std::string> default_title = {
+    {0/*"ja_JP"*/, "セーブデータ"},
+    {1/*"en_US"*/, "Saved Data"},
+    {2/*"fr_FR"*/, "Données sauvegardées"},
+    {3/*"es_ES"*/, "Datos guardados"},
+    {4/*"de_DE"*/, "Gespeicherte Daten"},
+    {5/*"it_IT"*/, "Dati salvati"},
+    {6/*"nl_NL"*/, "Opgeslagen data"},
+    {7/*"pt_PT"*/, "Dados guardados"},
+    {8/*"ru_RU"*/, "Сохраненные данные"},
+    {9/*"ko_KR"*/, "저장 데이터"},
+    {10/*"zh_CN"*/, "保存数据"},
+    {12/*"fi_FI"*/, "Tallennetut tiedot"},
+    {13/*"sv_SE"*/, "Sparade data"},
+    {14/*"da_DK"*/, "Gemte data"},
+    {15/*"no_NO"*/, "Lagrede data"},
+    {16/*"pl_PL"*/, "Zapisane dane"},
+    {17/*"pt_BR"*/, "Dados salvos"},
+    {19/*"tr_TR"*/, "Kayıtlı Veriler"},
 };
 // clang-format on
 
@@ -50,12 +48,13 @@ namespace Libraries::SaveData {
 
 fs::path SaveInstance::MakeTitleSavePath(Libraries::UserService::OrbisUserServiceUserId user_id,
                                          std::string_view game_serial) {
-    return Config::GetSaveDataPath() / std::to_string(user_id) / game_serial;
+    return EmulatorSettings.GetHomeDir() / std::to_string(user_id) / "savedata" / game_serial;
 }
 
-fs::path SaveInstance::MakeDirSavePath(Libraries::UserService::OrbisUserServiceUserId user_id,
-                                       std::string_view game_serial, std::string_view dir_name) {
-    return Config::GetSaveDataPath() / std::to_string(user_id) / game_serial / dir_name;
+fs::path SaveInstance::MakeDirSavePath(OrbisUserServiceUserId user_id, std::string_view game_serial,
+                                       std::string_view dir_name) {
+    return EmulatorSettings.GetHomeDir() / std::to_string(user_id) / "savedata" / game_serial /
+           dir_name;
 }
 
 uint64_t SaveInstance::GetMaxBlockFromSFO(const PSF& psf) {
@@ -73,9 +72,9 @@ fs::path SaveInstance::GetParamSFOPath(const fs::path& dir_path) {
 
 void SaveInstance::SetupDefaultParamSFO(PSF& param_sfo, std::string dir_name,
                                         std::string game_serial) {
-    std::string locale = Config::getEmulatorLanguage();
+    int locale = EmulatorSettings.GetConsoleLanguage();
     if (!default_title.contains(locale)) {
-        locale = "en_US";
+        locale = 1; // default to en_US if not found
     }
 
 #define P(type, key, ...) param_sfo.Add##type(std::string{key}, __VA_ARGS__)
@@ -107,7 +106,7 @@ SaveInstance::SaveInstance(int slot_num, Libraries::UserService::OrbisUserServic
     mount_point = "/savedata" + std::to_string(slot_num);
 
     this->exists = fs::exists(param_sfo_path);
-    this->mounted = g_mnt->GetMount(mount_point) != std::nullopt;
+    this->mounted = g_mnt->GetMount(mount_point) != nullptr;
 }
 
 SaveInstance::~SaveInstance() {
@@ -152,13 +151,13 @@ void SaveInstance::SetupAndMount(bool read_only, bool copy_icon, bool ignore_cor
     if (!exists) {
         CreateFiles();
         if (copy_icon) {
-            const auto& src_icon = g_mnt->GetHostPath("/app0/sce_sys/save_data.png");
-            if (Common::FS::Zar::Exists(src_icon)) {
+            if (auto bytes = g_mnt->ReadFile("/app0/sce_sys/save_data.png")) {
                 auto output_icon = GetIconPath();
                 if (fs::exists(output_icon)) {
                     fs::remove(output_icon);
                 }
-                Common::FS::Zar::CopyFile(src_icon, output_icon);
+                Common::FS::IOFile dst(output_icon, Common::FS::FileAccessMode::Create);
+                dst.WriteRaw<u8>(bytes->data(), bytes->size());
             }
         }
         exists = true;
@@ -207,7 +206,7 @@ void SaveInstance::Umount() {
     param_sfo = PSF();
 
     fs::remove(corrupt_file_path);
-    g_mnt->Unmount(save_path, mount_point);
+    g_mnt->Unmount(mount_point);
 }
 
 void SaveInstance::CreateFiles() {

@@ -1,4 +1,4 @@
-﻿// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -7,9 +7,8 @@
 #include "common/shared_first_mutex.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
-#include "video_core/renderer_vulkan/render_target_sync.h"
-#include "video_core/renderer_vulkan/storage_image_sync.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+#include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/texture_cache.h"
 
 namespace AmdGpu {
@@ -22,13 +21,12 @@ class MemoryManager;
 
 namespace Vulkan {
 
-class Scheduler;
-class RenderState;
 class GraphicsPipeline;
+class Runtime;
 
 class Rasterizer {
 public:
-    explicit Rasterizer(const Instance& instance, Scheduler& scheduler,
+    explicit Rasterizer(const Instance& instance, Scheduler& scheduler, Runtime& runtime,
                         AmdGpu::Liverpool* liverpool);
     ~Rasterizer();
 
@@ -36,8 +34,8 @@ public:
         return scheduler;
     }
 
-    [[nodiscard]] const Instance& GetInstance() const noexcept {
-        return instance;
+    [[nodiscard]] Runtime& GetRuntime() noexcept {
+        return runtime;
     }
 
     [[nodiscard]] VideoCore::BufferCache& GetBufferCache() noexcept {
@@ -50,10 +48,20 @@ public:
 
     void Draw(bool is_indexed, u32 index_offset = 0);
     void DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 size, u32 max_count,
-                      VAddr count_address);
+                      VAddr count_address, u16 vertex_sgpr_offset, u16 instance_sgpr_offset);
 
     void DispatchDirect();
-    void DispatchIndirect(VAddr address, u32 offset, u32 size, bool on_gpu);
+    void DispatchIndirect(VAddr address, u32 offset, u32 size);
+
+    void ScopeMarker(fmt::string_view fmt, fmt::format_args args, auto&& func) {
+        if (host_markers_enabled) {
+            ScopeMarkerBegin(fmt::vformat(fmt, args));
+            func();
+            ScopeMarkerEnd();
+        } else {
+            func();
+        }
+    }
 
     void ScopeMarkerBegin(const std::string_view& str, bool from_guest = false);
     void ScopeMarkerEnd(bool from_guest = false);
@@ -64,24 +72,25 @@ public:
     void FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds);
     void CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds);
     u32 ReadDataFromGds(u32 gsd_offset);
-    bool InvalidateMemory(VAddr addr, u64 size);
-    bool ReadMemory(VAddr addr, u64 size);
-    void ProcessDownloadImages();
+    bool InvalidateMemory(VAddr addr, u64 size, bool assume_locks = false);
+    /// Marks buffer memory a game thread is about to write as CPU modified ahead of it.
+    void InvalidateBuffersAhead(VAddr addr, u64 size);
+    bool ReadMemory(VAddr addr, u64 size, bool assume_locks = false);
+    /// Notes memory written past its page protection, like fence values.
+    void OnBackingWritten(VAddr addr, u64 size);
     bool IsMapped(VAddr addr, u64 size);
     void MapMemory(VAddr addr, u64 size);
+    void RegisterMemory(VAddr addr, u64 size);
     void UnmapMemory(VAddr addr, u64 size);
 
-    void CpSync();
     u64 Flush();
     void Finish();
-
     void OnSubmit();
-    void CommitPendingGpuRanges();
+    void OnFence();
 
     PipelineCache& GetPipelineCache() {
         return pipeline_cache;
     }
-    VideoCore::ImageId GetCurrentColorBuffer(u32 index = 0) const;
 
     template <typename Func>
     void ForEachMappedRangeInRange(VAddr addr, u64 size, Func&& func) {
@@ -91,6 +100,11 @@ public:
             func(mapped_range);
         }
     }
+
+    std::thread::id GetGpuCommandProcessorThread();
+#ifdef __linux__
+    u32 GetGpuCommandProcessorThreadId();
+#endif
 
 private:
     void PrepareRenderState(const GraphicsPipeline* pipeline);
@@ -113,12 +127,10 @@ private:
     void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding);
     bool BindResources(const Pipeline* pipeline);
 
-    void ResetBindings() {
-        for (auto& image_id : bound_images) {
-            texture_cache.GetImage(image_id).binding = {};
-        }
-        bound_images.clear();
-    }
+    void BindVertexBuffers(const GraphicsPipeline* pipeline);
+    void BindIndexBuffer(u32 index_offset = 0);
+
+    void ResetBindings(bool is_compute);
 
     bool IsComputeMetaClear(const Pipeline* pipeline);
     bool IsComputeImageCopy(const Pipeline* pipeline);
@@ -129,40 +141,81 @@ private:
 
     const Instance& instance;
     Scheduler& scheduler;
+    Runtime& runtime;
     VideoCore::PageManager page_manager;
     VideoCore::BufferCache buffer_cache;
     VideoCore::TextureCache texture_cache;
-    StorageImageSync storage_sync_;
-    RenderTargetSync rt_sync_;
-    // All storage images bound by the last BindTextures call. A compute dispatch can bind more
-    // than one storage image (multiple UAVs); every one of them needs its post-dispatch sync,
-    // not just the last one seen while iterating bindings.
-    boost::container::static_vector<VideoCore::ImageId, Shader::NUM_IMAGES>
-        pending_storage_image_ids_;
     AmdGpu::Liverpool* liverpool;
     Core::MemoryManager* memory;
     boost::icl::interval_set<VAddr> mapped_ranges;
     Common::SharedFirstMutex mapped_ranges_mutex;
     PipelineCache pipeline_cache;
+    const bool host_markers_enabled;
+    const bool guest_markers_enabled;
 
-    using RenderTargetInfo = std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc>;
-    std::array<RenderTargetInfo, AmdGpu::NUM_COLOR_BUFFERS> cb_descs;
+    struct ImageBinding {
+        VideoCore::ImageId image_id;
+        VideoCore::TextureCache::ImageDesc desc;
+    };
+    std::array<ImageBinding, Shader::NUM_IMAGES> image_bindings;
+    std::array<ImageBinding, AmdGpu::NUM_COLOR_BUFFERS> cb_descs;
     std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc> db_desc;
+
     boost::container::static_vector<vk::DescriptorImageInfo, Shader::NUM_IMAGES> image_infos;
     boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos;
+
+    struct BoundBuffer {
+        const VideoCore::Buffer* buffer;
+        u64 offset;
+        u32 size;
+        bool is_written;
+    };
+    /// Shader buffers, vertex buffers and the index buffer.
+    boost::container::static_vector<BoundBuffer, Shader::NUM_BUFFERS + MaxVertexBufferCount + 1>
+        bound_buffers;
     boost::container::static_vector<VideoCore::ImageId, Shader::NUM_IMAGES> bound_images;
 
     u32 set_write_index{};
     Pipeline::DescriptorWrites set_writes;
-    Pipeline::BufferBarriers buffer_barriers;
     Shader::PushData push_data;
 
-    using BufferBindingInfo = std::tuple<VideoCore::BufferId, AmdGpu::Buffer, u64>;
-    boost::container::static_vector<BufferBindingInfo, Shader::NUM_BUFFERS> buffer_bindings;
-    using ImageBindingInfo = std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc>;
-    boost::container::static_vector<ImageBindingInfo, Shader::NUM_IMAGES> image_bindings;
-    bool fault_process_pending{};
+    /// The vertex input last set in the command buffer, valid unless the dynamic state of the
+    /// scheduler says it is dirty.
+    VertexInputs<vk::VertexInputAttributeDescription2EXT> last_vertex_attributes;
+    VertexInputs<vk::VertexInputBindingDescription2EXT> last_vertex_bindings;
+
+    /// Everything the dynamic state of a draw is built from besides the registers covered by
+    /// their version, as of the last draw that built it.
+    struct DynamicStateInputs {
+        u64 regs_version{};
+        std::array<vk::ColorComponentFlags, AmdGpu::NUM_COLOR_BUFFERS> write_masks{};
+        bool feedback_loop{};
+        bool is_indexed{};
+
+        bool operator==(const DynamicStateInputs&) const = default;
+    };
+    mutable DynamicStateInputs last_dynamic_inputs{};
+
+    /// Everything the render targets of a draw are found from besides the registers covered by
+    /// their version, as of the last draw that found them.
+    struct RenderTargetInputs {
+        u64 regs_version{};
+        u64 image_generation{};
+        std::array<u32, AmdGpu::NUM_COLOR_BUFFERS> cb_extents{};
+        u32 db_extent{};
+        u32 mrt_mask{};
+
+        bool operator==(const RenderTargetInputs&) const = default;
+    };
+    RenderTargetInputs last_render_target_inputs{};
+
     bool attachment_feedback_loop{};
+    bool needs_barrier{};
+    /// Whether the draw being made reads memory in ways no accesses are kept for.
+    bool untracked_access{};
+    /// Whether the last work recorded was a dispatch, to count switches between draws and
+    /// dispatches.
+    bool last_work_compute{};
 };
 
 } // namespace Vulkan

@@ -3,10 +3,11 @@
 
 #pragma once
 
+#include <cstddef>
 #include <memory>
 #include "common/alignment.h"
 #include "common/types.h"
-#include "video_core/buffer_cache//region_definitions.h"
+#include "video_core/buffer_cache/region_definitions.h"
 
 namespace Vulkan {
 class Rasterizer;
@@ -14,15 +15,18 @@ class Rasterizer;
 
 namespace VideoCore {
 
-class PageManager {
-public:
-    // Use the same page size as the tracker.
-    static constexpr size_t PAGE_BITS = TRACKER_PAGE_BITS;
-    static constexpr size_t PAGE_SIZE = TRACKER_BYTES_PER_PAGE;
+struct UffdImpl;
+struct SignalImpl;
 
-    // Keep the lock granularity the same as region granularity. (since each regions has
-    // itself a lock)
-    static constexpr size_t PAGES_PER_LOCK = NUM_PAGES_PER_REGION;
+enum class PageOp : s8 {
+    None = 0,
+    Track = 1,
+    Untrack = -1,
+};
+
+class PageManager {
+    static constexpr size_t PM_PAGE_BITS = 12;
+    static constexpr size_t PM_PAGE_SIZE = 1ULL << PM_PAGE_BITS;
 
 public:
     explicit PageManager(Vulkan::Rasterizer* rasterizer);
@@ -35,28 +39,26 @@ public:
     void OnGpuUnmap(VAddr address, size_t size);
 
     /// Updates watches in the pages touching the specified region.
-    template <bool track>
-    void UpdatePageWatchers(VAddr addr, u64 size) const;
+    void UpdatePageWatchers(VAddr addr, u64 size, PageOp write_op) const;
 
-    /// Updates watches in the pages touching the specified region using a mask.
-    template <bool track, bool is_read = false>
-    void UpdatePageWatchersForRegion(VAddr base_addr, RegionBits& mask) const;
+    /// Updates watches in the pages touching the inclusive bounds using a mask.
+    void UpdatePageWatchersForRegion(VAddr base_addr, const Bounds& bounds,
+                                     const RegionBits& write_mask, const RegionBits& read_mask,
+                                     PageOp write_op, PageOp read_op) const;
 
     /// Returns page aligned address.
     static constexpr VAddr GetPageAddr(VAddr addr) {
-        return Common::AlignDown(addr, PAGE_SIZE);
+        return Common::AlignDown(addr, PM_PAGE_SIZE);
     }
 
     /// Returns address of the next page.
     static constexpr VAddr GetNextPageAddr(VAddr addr) {
-        return Common::AlignUp(addr + 1, PAGE_SIZE);
-    }
-
-    static constexpr size_t GetPageSize() {
-        return PAGE_SIZE;
+        return Common::AlignUp(addr + 1, PM_PAGE_SIZE);
     }
 
 private:
+    friend struct UffdImpl;
+    friend struct SignalImpl;
     struct Impl;
     std::unique_ptr<Impl> impl;
 };

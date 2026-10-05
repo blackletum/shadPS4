@@ -10,6 +10,7 @@ namespace VideoCore {
 
 using ImageId = Common::SlotId;
 using ImageViewId = Common::SlotId;
+using SamplerId = Common::SlotId;
 
 struct Offset2D {
     s32 x;
@@ -53,15 +54,15 @@ struct SubresourceLayers {
 };
 
 struct SubresourceBase {
-    u32 level = 0;
-    u32 layer = 0;
+    u16 level = 0;
+    u16 layer = 0;
 
     auto operator<=>(const SubresourceBase&) const = default;
 };
 
 struct SubresourceExtent {
-    u32 levels = 1;
-    u32 layers = 1;
+    u16 levels = 1;
+    u16 layers = 1;
 
     auto operator<=>(const SubresourceExtent&) const = default;
 };
@@ -70,21 +71,8 @@ struct SubresourceRange {
     SubresourceBase base;
     SubresourceExtent extent;
 
-    auto operator<=>(const SubresourceRange&) const = default;
+    bool operator==(const SubresourceRange&) const = default;
 };
-
-inline SubresourceRange ClampSubresourceRange(const SubresourceRange& range,
-                                              const SubresourceExtent& extent) {
-    SubresourceRange clamped = range;
-
-    clamped.base.level = std::min(clamped.base.level, static_cast<u32>(extent.levels - 1));
-    clamped.base.layer = std::min(clamped.base.layer, static_cast<u32>(extent.layers - 1));
-
-    clamped.extent.levels = std::min(clamped.extent.levels, extent.levels - clamped.base.level);
-    clamped.extent.layers = std::min(clamped.extent.layers, extent.layers - clamped.base.layer);
-
-    return clamped;
-}
 
 struct ImageCopy {
     SubresourceLayers src_subresource;

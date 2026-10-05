@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/arch.h"
-#include "common/config.h"
 #include "common/elf_info.h"
 #include "common/singleton.h"
 #include "core/libraries/ajm/ajm.h"
@@ -15,6 +14,7 @@
 #include "core/libraries/camera/camera.h"
 #include "core/libraries/companion/companion_httpd.h"
 #include "core/libraries/companion/companion_util.h"
+#include "core/libraries/content_export/content_export.h"
 #include "core/libraries/disc_map/disc_map.h"
 #include "core/libraries/fiber/fiber.h"
 #include "core/libraries/game_live_streaming/gamelivestreaming.h"
@@ -24,9 +24,10 @@
 #include "core/libraries/ime/error_dialog.h"
 #include "core/libraries/ime/ime.h"
 #include "core/libraries/ime/ime_dialog.h"
+#include "core/libraries/invitation_dialog/invitation_dialog.h"
 #include "core/libraries/kernel/kernel.h"
+#include "core/libraries/keyboard/keyboard.h"
 #include "core/libraries/libc_internal/libc_internal.h"
-#include "core/libraries/libpng/pngdec.h"
 #include "core/libraries/libs.h"
 #include "core/libraries/mouse/mouse.h"
 #include "core/libraries/move/move.h"
@@ -40,17 +41,18 @@
 #include "core/libraries/np/np_commerce/np_commerce.h"
 #include "core/libraries/np/np_common.h"
 #include "core/libraries/np/np_manager.h"
-#include "core/libraries/np/np_matching2.h"
+#include "core/libraries/np/np_matching2/np_matching2.h"
 #include "core/libraries/np/np_partner.h"
 #include "core/libraries/np/np_party.h"
 #include "core/libraries/np/np_profile_dialog/np_profile_dialog.h"
-#include "core/libraries/np/np_score.h"
-#include "core/libraries/np/np_signaling.h"
+#include "core/libraries/np/np_score/np_score.h"
+#include "core/libraries/np/np_signaling/np_signaling.h"
 #include "core/libraries/np/np_sns_facebook_dialog.h"
 #include "core/libraries/np/np_trophy.h"
-#include "core/libraries/np/np_tus.h"
-#include "core/libraries/np/np_web_api.h"
-#include "core/libraries/np/np_web_api2.h"
+#include "core/libraries/np/np_tus/np_tus.h"
+#include "core/libraries/np/np_utility/np_utility.h"
+#include "core/libraries/np/np_web_api/np_web_api.h"
+#include "core/libraries/np/np_web_api2/np_web_api2.h"
 #include "core/libraries/pad/pad.h"
 #include "core/libraries/playgo/playgo.h"
 #include "core/libraries/playgo/playgo_dialog.h"
@@ -63,13 +65,15 @@
 #include "core/libraries/screenshot/screenshot.h"
 #include "core/libraries/share_play/shareplay.h"
 #include "core/libraries/signin_dialog/signindialog.h"
+#include "core/libraries/sysmodule/sysmodule.h"
 #include "core/libraries/system/commondialog.h"
 #include "core/libraries/system/msgdialog.h"
-#include "core/libraries/system/sysmodule.h"
 #include "core/libraries/system/systemservice.h"
 #include "core/libraries/system/userservice.h"
 #include "core/libraries/ulobjmgr/ulobjmgr.h"
 #include "core/libraries/usbd/usbd.h"
+#include "core/libraries/video_recording/video_recording.h"
+#include "core/libraries/videodec/vdecsw.h"
 #include "core/libraries/videodec/videodec.h"
 #include "core/libraries/videodec/videodec2.h"
 #include "core/libraries/videoout/video_out.h"
@@ -81,10 +85,22 @@
 
 #include <array>
 
+void LinkSymbolImpl(Core::Loader::SymbolsResolver* sym, char const* nid, char const* lib,
+                    u16 libversion, char const* mod, u64 symbol,
+                    Core::Loader::SymbolType sym_type) {
+    Core::Loader::SymbolResolver sr{};
+    sr.name = nid;
+    sr.library = lib;
+    sr.library_version = libversion;
+    sr.module = mod;
+    sr.type = sym_type;
+    sym->AddSymbol(sr, symbol);
+}
+
 namespace Libraries {
 
 static void RegisterAudio3d(Core::Loader::SymbolsResolver* sym) {
-    if (Config::getAudioBackend() == Config::AudioBackend::OpenAL) {
+    if (EmulatorSettings.GetAudioBackend() == AudioBackend::OpenAL) {
         Libraries::Audio3dOpenAL::RegisterLib(sym);
     } else {
         Libraries::Audio3d::RegisterLib(sym);
@@ -95,7 +111,7 @@ void InitHLELibs(Core::Loader::SymbolsResolver* sym) {
     LOG_INFO(Lib_Kernel, "Initializing HLE libraries");
 
     auto* game_info = Common::Singleton<Common::ElfInfo>::Instance();
-    const auto& sys_module_path = Config::getSysModulesPath();
+    const auto& sys_module_path = EmulatorSettings.GetSysModulesDir();
     const auto& game_specific_modules_path =
         sys_module_path /
         (game_info->GameSerial().empty() ? std::string_view("no_serial") : game_info->GameSerial());
@@ -106,6 +122,7 @@ void InitHLELibs(Core::Loader::SymbolsResolver* sym) {
             {"libSceVideoOut.sprx", Libraries::VideoOut::RegisterLib},
             {"libSceUserService.sprx", Libraries::UserService::RegisterLib},
             {"libSceSystemService.sprx", Libraries::SystemService::RegisterLib},
+            {"libScePad.sprx", Libraries::Pad::RegisterLib},
             {"libSceCommonDialog.sprx", Libraries::CommonDialog::RegisterLib},
             {"libSceMsgDialog.sprx", Libraries::MsgDialog::RegisterLib},
             {"libSceAudioOut.sprx", Libraries::AudioOut::RegisterLib},
@@ -136,16 +153,14 @@ void InitHLELibs(Core::Loader::SymbolsResolver* sym) {
             {"libSceNpTus.sprx", Libraries::Np::NpTus::RegisterLib},
             {"libSceScreenShot.sprx", Libraries::ScreenShot::RegisterLib},
             {"libSceAppContent.sprx", Libraries::AppContent::RegisterLib},
-            {"libScePngDec.sprx", Libraries::PngDec::RegisterLib},
             {"libScePlayGo.sprx", Libraries::PlayGo::RegisterLib},
             {"libScePlayGoDialog.sprx", Libraries::PlayGo::Dialog::RegisterLib},
             {"libSceRandom.sprx", Libraries::Random::RegisterLib},
             {"libSceUsbd.sprx", Libraries::Usbd::RegisterLib},
-            {"libScePad.sprx", Libraries::Pad::RegisterLib},
             {"libSceAjm.sprx", Libraries::Ajm::RegisterLib},
             {"libSceErrorDialog.sprx", Libraries::ErrorDialog::RegisterLib},
             {"libSceImeDialog.sprx", Libraries::ImeDialog::RegisterLib},
-            {"libSceAvPlayer.sprx", Libraries::AvPlayer::RegisterLib},
+            {"libSceVdecsw.sprx", Libraries::Vdecsw::RegisterLib},
             {"libSceVideodec.sprx", Libraries::Videodec::RegisterLib},
             {"libSceVideodec2.sprx", Libraries::Videodec2::RegisterLib},
             {"libSceIme.sprx", Libraries::Ime::RegisterLib},
@@ -155,6 +170,7 @@ void InitHLELibs(Core::Loader::SymbolsResolver* sym) {
             {"libSceRazorCpu.sprx", Libraries::RazorCpu::RegisterLib},
             {"libSceMove.sprx", Libraries::Move::RegisterLib},
             {"libSceMouse.sprx", Libraries::Mouse::RegisterLib},
+            {"libSceKeyboard.sprx", Libraries::Keyboard::RegisterLib},
             {"libSceWebBrowserDialog.sprx", Libraries::WebBrowserDialog::RegisterLib},
             {"libSceZlib.sprx", Libraries::Zlib::RegisterLib},
             {"libSceHmd.sprx", Libraries::Hmd::RegisterLib},
@@ -167,7 +183,10 @@ void InitHLELibs(Core::Loader::SymbolsResolver* sym) {
             {"libSceCompanionUtil.sprx", Libraries::CompanionUtil::RegisterLib},
             {"libSceVoice.sprx", Libraries::Voice::RegisterLib},
             {"libSceVrTracker.sprx", Libraries::VrTracker::RegisterLib},
-
+            {"libSceContentExport.sprx", Libraries::ContentExport::RegisterLib},
+            {"libSceVideoRecording.sprx", Libraries::VideoRecording::RegisterLib},
+            {"libSceInvitationDialog.sprx", Libraries::InvitationDialog::RegisterLib},
+            {"libSceNpUtility.sprx", Libraries::Np::NpUtility::RegisterLib},
 #ifdef ARCH_X86_64
             {"libSceFiber.sprx", Libraries::Fiber::RegisterLib},
 #endif

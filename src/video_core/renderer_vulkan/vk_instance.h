@@ -21,11 +21,9 @@ namespace Vulkan {
 
 class Instance {
 public:
-    explicit Instance(bool validation = false, bool crash_diagnostic = false,
-                      bool manage_imgui = true);
+    explicit Instance(bool validation = false, bool crash_diagnostic = false);
     explicit Instance(Frontend::WindowSDL& window, s32 physical_device_index,
-                      bool enable_validation = false, bool enable_crash_diagnostic = false,
-                      bool manage_imgui = true);
+                      bool enable_validation = false, bool enable_crash_diagnostic = false);
     ~Instance();
 
     /// Returns a formatted string for the driver version
@@ -235,6 +233,11 @@ public:
         return vk13_features.subgroupSizeControl && vk13_props.maxSubgroupSize >= 64;
     }
 
+    /// Returns true if creating a pipeline can be made to fail instead of compiling it.
+    bool IsPipelineCreationCacheControlSupported() const {
+        return vk13_features.pipelineCreationCacheControl;
+    }
+
     /// Returns true when VK_KHR_workgroup_memory_explicit_layout is supported.
     bool IsWorkgroupMemoryExplicitLayoutSupported() const {
         return workgroup_memory_explicit_layout &&
@@ -262,14 +265,10 @@ public:
         return features.tessellationShader;
     }
 
-    /// Returns true when tessellation isolines are supported by the device
-    bool IsTessellationIsolinesSupported() const {
-        return !portability_subset || portability_features.tessellationIsolines;
-    }
-
-    /// Returns true when tessellation point mode is supported by the device
-    bool IsTessellationPointModeSupported() const {
-        return !portability_subset || portability_features.tessellationPointMode;
+    /// Returns true when the shaderSubgroupClock feature of
+    /// VK_KHR_shader_clock is supported.
+    bool IsShaderSubgroupClockSupported() const {
+        return shader_clock && shader_clock_features.shaderSubgroupClock;
     }
 
     /// Returns the vendor ID of the physical device
@@ -327,17 +326,12 @@ public:
         return properties.limits.minUniformBufferOffsetAlignment;
     }
 
-    ///  Returns the maximum size of uniform buffers.
-    vk::DeviceSize UniformMaxSize() const {
-        return properties.limits.maxUniformBufferRange;
-    }
-
     /// Returns the minimum required alignment for storage buffers
     vk::DeviceSize StorageMinAlignment() const {
         return properties.limits.minStorageBufferOffsetAlignment;
     }
 
-    /// Returns the minimum alignemt required for accessing host-mapped device memory
+    /// Returns the minimum alignment required for accessing host-mapped device memory
     vk::DeviceSize NonCoherentAtomSize() const {
         return properties.limits.nonCoherentAtomSize;
     }
@@ -365,6 +359,11 @@ public:
     /// Returns the maximum number of push descriptors.
     u32 MaxPushDescriptors() const {
         return push_descriptor_props.maxPushDescriptors;
+    }
+
+    /// Returns the maximum size of a single VkDeviceMemory
+    vk::DeviceSize MaxMemoryAllocationSize() const {
+        return vk11_props.maxMemoryAllocationSize;
     }
 
     /// Returns the vulkan 1.2 physical device properties.
@@ -402,6 +401,17 @@ public:
         return properties.limits.maxFramebufferHeight;
     }
 
+    /// Returns the maximum number of samplers that can be allocated at once.
+    u32 GetMaxSamplerAllocationCount() const {
+        if (driver_id == vk::DriverId::eMesaKosmickrisp) {
+            // FIXME: KosmicKrisp has an internal 1024 unique sampler limit before
+            // vkCreateSampler starts returning VK_ERROR_OUT_OF_HOST_MEMORY. Work
+            // around this for now by reducing the value to 1024.
+            return 1024;
+        }
+        return properties.limits.maxSamplerAllocationCount;
+    }
+
     /// Returns the sample count flags supported by color buffers.
     vk::SampleCountFlags GetColorSampleCounts() const {
         return properties.limits.framebufferColorSampleCounts;
@@ -435,6 +445,11 @@ public:
         return image_view_min_lod;
     }
 
+    /// Returns whether shaderStorageImageMultisample is supported.
+    bool IsMultisampleStorageImageSupported() const {
+        return features.shaderStorageImageMultisample;
+    }
+
     /// Returns whether the device can report memory usage.
     bool CanReportMemoryUsage() const {
         return supports_memory_budget;
@@ -445,7 +460,7 @@ public:
 
     /// Returns the total memory budget available to the device.
     [[nodiscard]] u64 GetTotalMemoryBudget() const {
-        return 4_GB; // PS4 VRAM limit for testing
+        return total_memory_budget;
     }
 
     /// Determines if a format is supported for a set of feature flags.
@@ -480,13 +495,13 @@ private:
     vk::PhysicalDeviceFeatures features;
     vk::PhysicalDeviceVulkan12Features vk12_features;
     vk::PhysicalDeviceVulkan13Features vk13_features;
-    vk::PhysicalDevicePortabilitySubsetFeaturesKHR portability_features;
     vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT dynamic_state_3_features;
     vk::PhysicalDeviceShaderAtomicFloat2FeaturesEXT shader_atomic_float2_features;
     vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR
         workgroup_memory_explicit_layout_features;
     vk::PhysicalDeviceImage2DViewOf3DFeaturesEXT image_2d_view_of_3d_features;
     vk::PhysicalDevicePrimitiveTopologyListRestartFeaturesEXT list_restart_features;
+    vk::PhysicalDeviceShaderClockFeaturesKHR shader_clock_features;
     vk::DriverIdKHR driver_id;
     vk::UniqueDebugUtilsMessengerEXT debug_callback{};
     std::string vendor_name;
@@ -517,14 +532,14 @@ private:
     bool shader_atomic_float{};
     bool shader_atomic_float2{};
     bool workgroup_memory_explicit_layout{};
-    bool portability_subset{};
+    bool maintenance_5{};
     bool maintenance_8{};
     bool attachment_feedback_loop{};
     bool image_2d_view_of_3d{};
     bool image_view_min_lod{};
+    bool shader_clock{};
     bool supports_memory_budget{};
     bool supports_block_texel_view{};
-    bool manage_imgui{true};
     u64 total_memory_budget{};
     std::vector<size_t> valid_heaps;
 };

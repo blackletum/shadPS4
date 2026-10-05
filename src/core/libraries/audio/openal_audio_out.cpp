@@ -27,8 +27,8 @@
 #define AL_REMIX_UNMATCHED_SOFT 0x0002
 #endif
 #include <queue>
-#include "common/config.h"
 #include "common/logging/log.h"
+#include "core/emulator_settings.h"
 #include "core/libraries/audio/audioout.h"
 #include "core/libraries/audio/audioout_backend.h"
 #include "core/libraries/audio/openal_manager.h"
@@ -188,12 +188,8 @@ public:
         }
         game_gain.store(max_channel_gain, std::memory_order_release);
 
-        const float slider_gain = Config::getVolumeSlider() * 0.01f;
-        float total_gain = max_channel_gain * slider_gain;
-
-        if (Config::isMuteEnabled()) {
-            total_gain = 0.0f;
-        }
+        const float slider_gain = EmulatorSettings.GetVolumeSlider() * 0.01f;
+        const float total_gain = max_channel_gain * slider_gain;
 
         const float current = current_gain.load(std::memory_order_acquire);
         if (std::abs(total_gain - current) < VOLUME_EPSILON) {
@@ -315,11 +311,7 @@ private:
         }
 
         // Initialize current gain
-        float initial_gain = Config::getVolumeSlider() * 0.01f;
-        if (Config::isMuteEnabled()) {
-            initial_gain = 0.0f;
-        }
-        current_gain.store(initial_gain, std::memory_order_relaxed);
+        current_gain.store(EmulatorSettings.GetVolumeSlider() * 0.01f, std::memory_order_relaxed);
         alSourcef(source, AL_GAIN, current_gain.load(std::memory_order_relaxed));
 
         // Prime buffers with silence
@@ -379,11 +371,11 @@ private:
         switch (type) {
         case OrbisAudioOutPort::Main:
         case OrbisAudioOutPort::Bgm:
-            return Config::getMainOutputDevice();
+            return EmulatorSettings.GetOpenALMainOutputDevice();
         case OrbisAudioOutPort::PadSpk:
-            return Config::getPadSpkOutputDevice();
+            return EmulatorSettings.GetOpenALPadSpkOutputDevice();
         default:
-            return Config::getMainOutputDevice();
+            return EmulatorSettings.GetOpenALMainOutputDevice();
         }
     }
 
@@ -396,12 +388,8 @@ private:
 
         last_volume_check_time = current_time;
 
-        float config_volume = Config::getVolumeSlider() * 0.01f;
-
-        if (Config::isMuteEnabled()) {
-            config_volume = 0.0f;
-        }
-
+        const float config_volume =
+            EmulatorSettings.GetVolumeSlider() * 0.01f * game_gain.load(std::memory_order_acquire);
         const float stored_gain = current_gain.load(std::memory_order_acquire);
 
         if (std::abs(config_volume - stored_gain) > VOLUME_EPSILON) {
@@ -969,7 +957,7 @@ private:
             d[i] = OrbisFloatToS16(s[i]);
         }
     }
-#elif
+#else
     static void ConvertF32ToS16Stereo(const void* src, void* dst, u32 frames, const float*) {
         const float* s = static_cast<const float*>(src);
         s16* d = static_cast<s16*>(dst);
@@ -1013,7 +1001,7 @@ private:
             d[i] = OrbisFloatToS16(s[i]);
         }
     }
-#elif
+#else
     static void ConvertF32ToS16_8CH(const void* src, void* dst, u32 frames, const float*) {
         const float* s = static_cast<const float*>(src);
         s16* d = static_cast<s16*>(dst);

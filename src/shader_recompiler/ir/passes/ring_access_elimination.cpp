@@ -25,8 +25,8 @@ void RingAccessElimination(const IR::Program& program, const RuntimeInfo& runtim
         }
     };
 
-    switch (program.info.stage) {
-    case Stage::Local: {
+    switch (program.info.hw_stage) {
+    case HwStage::Local: {
         ForEachInstruction([=](IR::IREmitter& ir, IR::Inst& inst) {
             const auto opcode = inst.GetOpcode();
             switch (opcode) {
@@ -38,8 +38,8 @@ void RingAccessElimination(const IR::Program& program, const RuntimeInfo& runtim
                 ASSERT(inst.Arg(0).IsImmediate());
 
                 u32 offset = inst.Arg(0).U32();
-                IR::Value data = is_composite ? ir.UnpackUint2x32(IR::U64{inst.Arg(1).Resolve()})
-                                              : inst.Arg(1).Resolve();
+                IR::Value data =
+                    is_composite ? ir.UnpackUint2x32(IR::U64{inst.Arg(1)}) : inst.Arg(1);
                 for (s32 i = 0; i < num_components; i++) {
                     const auto attrib = IR::Attribute::Param0 + (offset / 16);
                     const auto comp = (offset / 4) % 4;
@@ -57,7 +57,7 @@ void RingAccessElimination(const IR::Program& program, const RuntimeInfo& runtim
         });
         break;
     }
-    case Stage::Export: {
+    case HwStage::Export: {
         ForEachInstruction([=](IR::IREmitter& ir, IR::Inst& inst) {
             const auto opcode = inst.GetOpcode();
             switch (opcode) {
@@ -68,7 +68,7 @@ void RingAccessElimination(const IR::Program& program, const RuntimeInfo& runtim
                 }
 
                 const auto offset = inst.Flags<IR::BufferInstInfo>().inst_offset.Value();
-                ASSERT(offset < runtime_info.es_info.vertex_data_size * 4);
+                ASSERT(offset < runtime_info.hw.es.vertex_data_size * 4);
                 const auto data = ir.BitCast<IR::F32>(IR::U32{inst.Arg(2)});
                 const auto attrib =
                     IR::Value{offset < 16 ? IR::Attribute::Position0
@@ -88,23 +88,10 @@ void RingAccessElimination(const IR::Program& program, const RuntimeInfo& runtim
         });
         break;
     }
-    case Stage::Geometry: {
-        const auto& gs_info = runtime_info.gs_info;
+    case HwStage::Geometry: {
+        const auto& gs_info = runtime_info.hw.gs;
         info.gs_copy_data = Shader::ParseCopyShader(gs_info.vs_copy);
 
-        u32 output_vertices = gs_info.output_vertices;
-        if (info.gs_copy_data.output_vertices &&
-            info.gs_copy_data.output_vertices != output_vertices) {
-            // ASSERT_MSG(output_vertices > info.gs_copy_data.output_vertices &&
-            //                gs_info.mode == AmdGpu::Liverpool::GsMode::Mode::ScenarioG,
-            //             "Invalid geometry shader vertex configuration scenario = {}, max_vert_out
-            //             = "
-            //             "{}, output_vertices = {}",
-            //             u32(gs_info.mode), output_vertices, info.gs_copy_data.output_vertices);
-            LOG_WARNING(Render_Vulkan, "MAX_VERT_OUT {} is larger than actual output vertices {}",
-                        output_vertices, info.gs_copy_data.output_vertices);
-            output_vertices = info.gs_copy_data.output_vertices;
-        }
         u32 dwords_per_vertex = gs_info.out_vertex_data_size;
         if (info.gs_copy_data.num_comps && info.gs_copy_data.num_comps > dwords_per_vertex) {
             LOG_WARNING(Render_Vulkan,
@@ -127,7 +114,7 @@ void RingAccessElimination(const IR::Program& program, const RuntimeInfo& runtim
                                            .U32() >>
                                        2;
                 const auto soffset = IR::GetBufferSOffsetArg(&inst);
-                const auto bucket = soffset.Resolve().U32() / 256u;
+                const auto bucket = soffset.U32() / 256u;
                 const auto attrib = bucket < 4 ? IR::Attribute::Position0
                                                : IR::Attribute::Param0 + (bucket / 4 - 1);
                 const auto comp = bucket % 4;
@@ -146,41 +133,17 @@ void RingAccessElimination(const IR::Program& program, const RuntimeInfo& runtim
 
                 const auto offset = inst.Flags<IR::BufferInstInfo>().inst_offset.Value();
                 const auto data = ir.BitCast<IR::F32>(IR::U32{inst.Arg(2)});
-                const auto comp_ofs = output_vertices * 4u;
-                const auto output_size = comp_ofs * dwords_per_vertex;
-
-                auto& attr_map = info.gs_copy_data.attr_map;
+                const auto comp_ofs = info.gs_copy_data.output_vertices * sizeof(u32);
+                const auto output_size = gs_info.output_vertices * dwords_per_vertex * sizeof(u32);
 
                 const auto vc_read_ofs = (((offset / comp_ofs) * comp_ofs) % output_size) * 16u;
-
-                auto it = attr_map.find(vc_read_ofs);
-                if (it == attr_map.end()) {
-                    LOG_ERROR(Render,
-                              "Missing vc_read_ofs={} in attr_map. Shader hash=0x{:08X}\nKnown "
-                              "attribute offsets:",
-                              vc_read_ofs, info.pgm_hash);
-
-                    for (const auto& kv : attr_map) {
-                        LOG_ERROR(Render, " - vc_read_ofs={} -> (attr={}, comp={})", kv.first,
-                                  int(kv.second.first), int(kv.second.second));
-                    }
-
-                    // Add a dedicated warning line similar to ASSERT_MSG
-                    LOG_ERROR(Render,
-                              "attr_map missing vc_read_ofs {} (Shader hash=0x{:08X}). Inserting "
-                              "fallback.",
-                              vc_read_ofs, info.pgm_hash);
-
-                    // Insert fallback - Position0, component 0 is a safe default guess
-                    attr_map[vc_read_ofs] = {IR::Attribute::Position0, 0};
-                    it = attr_map.find(vc_read_ofs);
-                }
-
+                const auto& it = info.gs_copy_data.attr_map.find(vc_read_ofs);
+                ASSERT(it != info.gs_copy_data.attr_map.cend());
                 const auto& [attr, comp] = it->second;
 
                 inst.Invalidate();
                 if (IsPosition(attr)) {
-                    ExportPosition(ir, runtime_info.gs_info, attr, comp, data);
+                    ExportPosition(ir, gs_info, false, attr, comp, data);
                 } else {
                     ir.SetAttribute(attr, data, comp);
                 }

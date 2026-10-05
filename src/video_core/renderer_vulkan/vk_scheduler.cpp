@@ -1,8 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <cmath>
+
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/logging/log.h"
+#include "common/perf_profiler.h"
 #include "common/thread.h"
 #include "imgui/renderer/texture_manager.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -10,14 +15,28 @@
 
 namespace Vulkan {
 
+namespace {
+
+/// Draws, dispatches, barriers, render passes, switches between draws and dispatches and barriers
+/// right before them counted so far, what the GPU time of command buffers is fit to.
+Scheduler::CostCounts CountCosts() {
+    using Common::Perf::Counter;
+    return {
+        Common::Perf::Total(Counter::Draws),        Common::Perf::Total(Counter::Dispatches),
+        Common::Perf::Total(Counter::Barriers),     Common::Perf::Total(Counter::RenderPasses),
+        Common::Perf::Total(Counter::WorkSwitches), Common::Perf::Total(Counter::SwitchBarriers)};
+}
+
+} // Anonymous namespace
+
 std::mutex Scheduler::submit_mutex;
 
 Scheduler::Scheduler(const Instance& instance)
-    : instance{instance}, master_semaphore{instance}, command_pool{instance, &master_semaphore} {
+    : instance{instance}, work_semaphore{instance}, command_pool{instance, &work_semaphore} {
 #if TRACY_GPU_ENABLED
     profiler_scope = reinterpret_cast<tracy::VkCtxScope*>(std::malloc(sizeof(tracy::VkCtxScope)));
 #endif
-    AllocateWorkerCommandBuffers();
+    BeginSession();
     priority_pending_ops_thread =
         std::jthread(std::bind_front(&Scheduler::PriorityPendingOpsThread, this));
 }
@@ -28,11 +47,205 @@ Scheduler::~Scheduler() {
 #endif
 }
 
+void Scheduler::MeasureGpuTime() {
+    const auto physical_device = instance.GetPhysicalDevice();
+    const auto families = physical_device.getQueueFamilyProperties();
+    const u32 family = instance.GetGraphicsQueueFamilyIndex();
+    const u32 valid_bits = family < families.size() ? families[family].timestampValidBits : 0;
+    if (valid_bits == 0) {
+        return;
+    }
+    const vk::QueryPoolCreateInfo pool_ci = {
+        .queryType = vk::QueryType::eTimestamp,
+        .queryCount = NumTimestampPairs * 2,
+    };
+    auto [result, pool] = instance.GetDevice().createQueryPoolUnique(pool_ci);
+    if (result != vk::Result::eSuccess) {
+        return;
+    }
+    timestamp_pool = std::move(pool);
+    const vk::QueryPoolCreateInfo run_pool_ci = {
+        .queryType = vk::QueryType::eTimestamp,
+        .queryCount = NumTimestampPairs * RunMarksPerPair,
+    };
+    auto [run_result, new_run_pool] = instance.GetDevice().createQueryPoolUnique(run_pool_ci);
+    if (run_result == vk::Result::eSuccess) {
+        run_pool = std::move(new_run_pool);
+    }
+    timestamp_period_ns = physical_device.getProperties().limits.timestampPeriod;
+    timestamp_mask = valid_bits >= 64 ? ~u64{0} : (u64{1} << valid_bits) - 1;
+}
+
+void Scheduler::CollectGpuTimes() {
+    while (!submitted_timestamps.empty() &&
+           work_semaphore.IsFree(submitted_timestamps.front().tick)) {
+        const SubmittedTimestamps submitted = std::move(submitted_timestamps.front());
+        const u32 pair = submitted.pair;
+        const auto& counts = submitted.counts;
+        submitted_timestamps.pop_front();
+        std::array<u64, 2> times{};
+        const auto result = instance.GetDevice().getQueryPoolResults(
+            *timestamp_pool, pair * 2, 2, sizeof(times), times.data(), sizeof(u64),
+            vk::QueryResultFlagBits::e64);
+        const u64 start = times[0] & timestamp_mask;
+        const u64 end = times[1] & timestamp_mask;
+        if (result != vk::Result::eSuccess || end <= start) {
+            continue;
+        }
+        // Command buffers can overlap on the GPU, so only the time past the latest end counted
+        // is added.
+        const u64 counted_start = std::max(start, counted_gpu_end);
+        if (end > counted_start) {
+            Common::Perf::Count(
+                Common::Perf::Counter::GpuBusyNs,
+                static_cast<u64>(static_cast<double>(end - counted_start) * timestamp_period_ns));
+            if (!submitted.run_marks_overflow) {
+                CountWorkRuns(pair, counted_start, end, submitted.first_run_compute,
+                              submitted.run_marks);
+            }
+        }
+        counted_gpu_end = std::max(counted_gpu_end, end);
+        if (counts) {
+            FitGpuCost(static_cast<double>(end - start) * timestamp_period_ns / 1000.0, *counts);
+        }
+    }
+}
+
+void Scheduler::CountWorkRuns(u32 pair, u64 start, u64 end, bool first_run_compute,
+                              const RunMarks& run_marks) {
+    // A run lasts from where it began, or the command buffer did, to where the next one began, or
+    // the command buffer ended. Marks are written once the work before them is done.
+    std::array<u64, RunMarksPerPair> marks{};
+    if (!run_marks.empty()) {
+        const auto result = instance.GetDevice().getQueryPoolResults(
+            *run_pool, pair * RunMarksPerPair, static_cast<u32>(run_marks.size()),
+            run_marks.size() * sizeof(u64), marks.data(), sizeof(u64),
+            vk::QueryResultFlagBits::e64);
+        if (result != vk::Result::eSuccess) {
+            return;
+        }
+    }
+    u64 run_start = start;
+    bool compute = first_run_compute;
+    const auto count_run = [&](u64 run_end) {
+        run_end = std::min(run_end, end);
+        if (run_end > run_start) {
+            const auto ns =
+                static_cast<u64>(static_cast<double>(run_end - run_start) * timestamp_period_ns);
+            Common::Perf::Count(compute ? Common::Perf::Counter::GpuDispatchRunNs
+                                        : Common::Perf::Counter::GpuDrawRunNs,
+                                ns);
+            run_start = run_end;
+        }
+    };
+    for (size_t i = 0; i < run_marks.size(); ++i) {
+        count_run(marks[i] & timestamp_mask);
+        compute = run_marks[i];
+    }
+    count_run(end);
+}
+
+void Scheduler::FitGpuCost(double gpu_us, const CostCounts& counts) {
+    // The GPU is busy most of a frame, and what in a command buffer takes its time decides what
+    // would shorten it.
+    static constexpr size_t NumTerms = NumCostTerms;
+    std::array<double, NumTerms> x{};
+    for (size_t i = 0; i < counts.size(); ++i) {
+        x[i] = static_cast<double>(counts[i]);
+    }
+    x[NumTerms - 1] = 1.0;
+    for (size_t i = 0; i < NumTerms; ++i) {
+        for (size_t j = 0; j < NumTerms; ++j) {
+            cost_xx[i][j] += x[i] * x[j];
+        }
+        cost_xy[i] += x[i] * gpu_us;
+    }
+    cost_yy += gpu_us * gpu_us;
+    ++cost_samples;
+
+    const auto now = std::chrono::steady_clock::now();
+    if (last_cost_report == std::chrono::steady_clock::time_point{}) {
+        last_cost_report = now;
+    }
+    if (now - last_cost_report < std::chrono::seconds{10} || cost_samples < 100) {
+        return;
+    }
+    last_cost_report = now;
+
+    // Solves the normal equations by elimination. A little ridge keeps a term that didn't vary,
+    // like dispatches in a scene without any, from leaving them singular.
+    auto a = cost_xx;
+    auto b = cost_xy;
+    double max_diagonal = 0.0;
+    for (size_t i = 0; i < NumTerms; ++i) {
+        max_diagonal = std::max(max_diagonal, a[i][i]);
+    }
+    for (size_t i = 0; i < NumTerms; ++i) {
+        a[i][i] += max_diagonal * 1e-9 + 1e-12;
+    }
+    for (size_t col = 0; col < NumTerms; ++col) {
+        size_t pivot = col;
+        for (size_t row = col + 1; row < NumTerms; ++row) {
+            if (std::abs(a[row][col]) > std::abs(a[pivot][col])) {
+                pivot = row;
+            }
+        }
+        std::swap(a[col], a[pivot]);
+        std::swap(b[col], b[pivot]);
+        for (size_t row = col + 1; row < NumTerms; ++row) {
+            const double factor = a[row][col] / a[col][col];
+            for (size_t k = col; k < NumTerms; ++k) {
+                a[row][k] -= factor * a[col][k];
+            }
+            b[row] -= factor * b[col];
+        }
+    }
+    std::array<double, NumTerms> cost{};
+    for (size_t i = NumTerms; i-- > 0;) {
+        double sum = b[i];
+        for (size_t k = i + 1; k < NumTerms; ++k) {
+            sum -= a[i][k] * cost[k];
+        }
+        cost[i] = sum / a[i][i];
+    }
+
+    // How much of the GPU time each part accounts for, and how well the fit follows it.
+    const double samples = static_cast<double>(cost_samples);
+    const double total_us = cost_xy[NumTerms - 1];
+    std::array<double, NumTerms> share{};
+    double explained = 0.0;
+    double fitted_squares = 0.0;
+    for (size_t i = 0; i < NumTerms; ++i) {
+        share[i] = total_us > 0.0 ? cost[i] * cost_xx[i][NumTerms - 1] * 100.0 / total_us : 0.0;
+        explained += cost[i] * cost_xy[i];
+        for (size_t k = 0; k < NumTerms; ++k) {
+            fitted_squares += cost[i] * cost_xx[i][k] * cost[k];
+        }
+    }
+    const double residual = cost_yy - 2.0 * explained + fitted_squares;
+    const double variation = cost_yy - total_us * total_us / samples;
+    const double fit = variation > 0.0 ? 100.0 * (1.0 - residual / variation) : 0.0;
+    LOG_INFO(Render_Vulkan,
+             "Host GPU time of command buffers: {:.2f} us a draw ({:.0f}%), {:.2f} us a dispatch "
+             "({:.0f}%), {:.2f} us a barrier ({:.0f}%), {:.2f} us a render pass ({:.0f}%), {:.2f} "
+             "us a switch between draws and dispatches ({:.0f}%), {:.2f} us more if a barrier came "
+             "right before it ({:.0f}%) and {:.0f} us each ({:.0f}%), following {:.0f}% of its "
+             "variation over {} command buffers of {:.0f} us on average",
+             cost[0], share[0], cost[1], share[1], cost[2], share[2], cost[3], share[3], cost[4],
+             share[4], cost[5], share[5], cost[6], share[6], fit, cost_samples, total_us / samples);
+
+    cost_xx = {};
+    cost_xy = {};
+    cost_yy = 0.0;
+    cost_samples = 0;
+}
+
 void Scheduler::BeginRendering(const RenderState& new_state) {
     if (is_rendering && render_state == new_state) {
         return;
     }
     EndRendering();
+    Common::Perf::Count(Common::Perf::Counter::RenderPasses);
     is_rendering = true;
     render_state = new_state;
 
@@ -80,7 +293,7 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
         .pStencilAttachment = db.has_stencil ? &stencil_attachment : nullptr,
     };
 
-    current_cmdbuf.beginRendering(rendering_info);
+    CommandBuffer().beginRendering(rendering_info);
 }
 
 void Scheduler::EndRendering() {
@@ -88,7 +301,31 @@ void Scheduler::EndRendering() {
         return;
     }
     is_rendering = false;
-    current_cmdbuf.endRendering();
+    CommandBuffer().endRendering();
+}
+
+vk::CommandBuffer Scheduler::UploadCommandBuffer() {
+    auto& upload_cmdbuf = sessions.back().upload;
+    if (upload_cmdbuf) {
+        return upload_cmdbuf;
+    }
+    const vk::CommandBufferBeginInfo begin_info = {
+        .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
+    };
+    upload_cmdbuf = command_pool.Commit();
+    Check(upload_cmdbuf.begin(begin_info));
+    // Work submitted before may still read or write what is copied to.
+    const vk::MemoryBarrier2 barrier = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eCopy,
+        .dstAccessMask = vk::AccessFlagBits2::eTransferRead | vk::AccessFlagBits2::eTransferWrite,
+    };
+    upload_cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers = &barrier,
+    });
+    return upload_cmdbuf;
 }
 
 void Scheduler::Flush(SubmitInfo& info) {
@@ -110,28 +347,82 @@ void Scheduler::Finish() {
 }
 
 void Scheduler::Wait(u64 tick) {
-    if (tick >= master_semaphore.CurrentTick()) {
-        Flush();
+    if (tick >= work_semaphore.CurrentTick()) {
+        // Make sure we are not waiting for the current tick without signalling
+        SubmitInfo info{};
+        Flush(info);
     }
-    master_semaphore.Wait(tick);
+    if (work_semaphore.IsFree(tick)) {
+        return;
+    }
+    Common::Perf::ScopedStall stall{Common::Perf::Stall::GpuWait};
+    work_semaphore.Wait(tick);
 }
 
 void Scheduler::PopPendingOperations() {
-    std::unique_lock lk(priority_pending_ops_mutex);
-    master_semaphore.Refresh();
-    while (!pending_ops.empty() && master_semaphore.IsFree(pending_ops.front().gpu_tick)) {
+    // Called for every draw, so neither the lock nor the driver is asked when nothing waits. An
+    // operation deferred meanwhile is run by a later call.
+    if (num_pending_ops.load(std::memory_order_acquire) == 0) {
+        return;
+    }
+    std::unique_lock lk(pending_ops_mutex);
+    if (pending_ops.empty()) {
+        return;
+    }
+    work_semaphore.Refresh();
+    while (!pending_ops.empty() && work_semaphore.IsFree(pending_ops.front().gpu_tick)) {
         pending_ops.front().callback();
         pending_ops.pop();
     }
+    num_pending_ops.store(pending_ops.size(), std::memory_order_release);
 }
 
-void Scheduler::AllocateWorkerCommandBuffers() {
+void Scheduler::MarkWorkRun(bool compute) {
+    if (compute == run_compute) {
+        return;
+    }
+    run_compute = compute;
+    auto& session = sessions.back();
+    if (session.timestamp_pair == NoTimestamps || !run_pool) {
+        return;
+    }
+    if (session.run_marks.size() == session.run_marks.capacity()) {
+        session.run_marks_overflow = true;
+        return;
+    }
+    // Written once the work before it is done, which is where the run it ends is over.
+    session.primary.writeTimestamp2(vk::PipelineStageFlagBits2::eAllCommands, *run_pool,
+                                    session.timestamp_pair * RunMarksPerPair +
+                                        static_cast<u32>(session.run_marks.size()));
+    session.run_marks.push_back(compute);
+}
+
+void Scheduler::BeginSession() {
+    EndSession();
+
+    auto& session = sessions.emplace_back();
+    ++session_id;
+
     const vk::CommandBufferBeginInfo begin_info = {
         .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
     };
-
-    current_cmdbuf = command_pool.Commit();
-    Check(current_cmdbuf.begin(begin_info));
+    session.primary = command_pool.Commit();
+    Check(session.primary.begin(begin_info));
+    // Pairs are used in turn, so the next one is free unless all are waiting for results.
+    if (timestamp_pool && submitted_timestamps.size() + 1 < NumTimestampPairs) {
+        const u32 pair = next_timestamp_pair;
+        next_timestamp_pair = (next_timestamp_pair + 1) % NumTimestampPairs;
+        session.primary.resetQueryPool(*timestamp_pool, pair * 2, 2);
+        session.primary.writeTimestamp2(vk::PipelineStageFlagBits2::eTopOfPipe, *timestamp_pool,
+                                        pair * 2);
+        session.timestamp_pair = pair;
+        session.counts = CountCosts();
+        session.thread = std::this_thread::get_id();
+        if (run_pool) {
+            session.primary.resetQueryPool(*run_pool, pair * RunMarksPerPair, RunMarksPerPair);
+        }
+        session.first_run_compute = run_compute;
+    }
 
     // Invalidate dynamic state so it gets applied to the new command buffer.
     dynamic_state.Invalidate();
@@ -146,9 +437,44 @@ void Scheduler::AllocateWorkerCommandBuffers() {
 #endif
 }
 
+void Scheduler::EndSession() {
+    if (sessions.empty()) {
+        return;
+    }
+
+    if (on_session) {
+        on_session();
+    }
+
+    const auto& session = sessions.back();
+    if (session.upload) {
+        // The work recorded after the uploads reads and writes what they copied to.
+        const vk::MemoryBarrier2 barrier = {
+            .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
+            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
+        };
+        session.upload.pipelineBarrier2(vk::DependencyInfo{
+            .memoryBarrierCount = 1,
+            .pMemoryBarriers = &barrier,
+        });
+        Check(session.upload.end());
+    }
+
+    EndRendering();
+    if (session.timestamp_pair != NoTimestamps) {
+        session.primary.writeTimestamp2(vk::PipelineStageFlagBits2::eBottomOfPipe, *timestamp_pool,
+                                        session.timestamp_pair * 2 + 1);
+    }
+    Check(session.primary.end());
+}
+
 void Scheduler::SubmitExecution(SubmitInfo& info) {
     std::scoped_lock lk{submit_mutex};
-    const u64 signal_value = master_semaphore.NextTick();
+    const u64 signal_value = work_semaphore.NextTick();
+    work_since_submit = 0;
+    Common::Perf::Count(Common::Perf::Counter::Submits);
 
 #if TRACY_GPU_ENABLED
     auto* profiler_ctx = instance.GetProfilerContext();
@@ -158,10 +484,42 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     }
 #endif
 
-    EndRendering();
-    Check(current_cmdbuf.end());
+    if (on_submit) {
+        on_submit(info);
+    }
 
-    const vk::Semaphore timeline = master_semaphore.Handle();
+    EndSession();
+
+    std::vector<vk::CommandBuffer> cmd_buffers;
+    cmd_buffers.reserve(sessions.size() * 2);
+
+    for (const auto& session : sessions) {
+        if (session.upload) {
+            cmd_buffers.push_back(session.upload);
+        }
+        cmd_buffers.push_back(session.primary);
+        if (session.timestamp_pair != NoTimestamps) {
+            // Counts are only told apart for the command buffer when one thread recorded it all.
+            std::optional<CostCounts> counts;
+            if (session.thread == std::this_thread::get_id()) {
+                counts = CountCosts();
+                for (size_t i = 0; i < counts->size(); ++i) {
+                    (*counts)[i] -= session.counts[i];
+                }
+            }
+            submitted_timestamps.push_back({
+                .tick = signal_value,
+                .pair = session.timestamp_pair,
+                .counts = counts,
+                .first_run_compute = session.first_run_compute,
+                .run_marks = session.run_marks,
+                .run_marks_overflow = !run_pool || session.run_marks_overflow,
+            });
+        }
+    }
+    sessions.clear();
+
+    const vk::Semaphore timeline = work_semaphore.Handle();
     info.AddSignal(timeline, signal_value);
 
     static constexpr std::array<vk::PipelineStageFlags, 2> wait_stage_masks = {
@@ -181,8 +539,8 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
         .waitSemaphoreCount = info.num_wait_semas,
         .pWaitSemaphores = info.wait_semas.data(),
         .pWaitDstStageMask = wait_stage_masks.data(),
-        .commandBufferCount = 1U,
-        .pCommandBuffers = &current_cmdbuf,
+        .commandBufferCount = static_cast<u32>(cmd_buffers.size()),
+        .pCommandBuffers = cmd_buffers.data(),
         .signalSemaphoreCount = info.num_signal_semas,
         .pSignalSemaphores = info.signal_semas.data(),
     };
@@ -191,8 +549,9 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
 
-    master_semaphore.Refresh();
-    AllocateWorkerCommandBuffers();
+    work_semaphore.Refresh();
+    CollectGpuTimes();
+    BeginSession();
 
     // Apply pending operations
     PopPendingOperations();
@@ -215,7 +574,7 @@ void Scheduler::PriorityPendingOpsThread(std::stop_token stoken) {
             priority_pending_ops.pop();
         }
 
-        master_semaphore.Wait(op.gpu_tick);
+        work_semaphore.Wait(op.gpu_tick);
         if (stoken.stop_requested()) {
             break;
         }
@@ -380,6 +739,9 @@ void DynamicState::Commit(const Instance& instance, const vk::CommandBuffer& cmd
         cmdbuf.setAttachmentFeedbackLoopEnableEXT(feedback_loop_enabled
                                                       ? vk::ImageAspectFlagBits::eColor
                                                       : vk::ImageAspectFlagBits::eNone);
+        // Pipelines don't take this state dynamically, and binding one after it sets it back to
+        // theirs, as draws always did before binding only pipelines that changed.
+        dirty_state.graphics_pipeline = true;
     }
 }
 

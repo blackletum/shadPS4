@@ -1,11 +1,11 @@
-//  SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
+//  SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 //  SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "frame_graph.h"
 
-#include "common/config.h"
 #include "common/singleton.h"
 #include "core/debug_state.h"
+#include "core/emulator_settings.h"
 #include "imgui.h"
 #include "imgui_internal.h"
 
@@ -29,9 +29,7 @@ void FrameGraph::DrawFrameGraph() {
         return;
     }
 
-    float target_formula = std::min(static_cast<float>(Config::vblankFreq()),
-                                    static_cast<float>(Config::getFpsLimit()));
-    float target_dt = 1.0f / target_formula;
+    float target_dt = 1.0f / (float)EmulatorSettings.GetVblankFrequency();
     float cur_pos_x = pos.x + full_width;
     pos.y += FRAME_GRAPH_PADDING_Y;
     const float final_pos_y = pos.y + FRAME_GRAPH_HEIGHT;
@@ -76,9 +74,7 @@ void FrameGraph::Draw() {
         return;
     }
     SetNextWindowSize({308.0, 270.0f}, ImGuiCond_FirstUseEver);
-    ImGuiWindowFlags window_flags =
-        ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNavInputs;
-    if (Begin("Video debug info", &is_open, window_flags)) {
+    if (Begin("Video debug info", &is_open)) {
         const auto& ctx = *GImGui;
         const auto& io = ctx.IO;
         const auto& window = *ctx.CurrentWindow;
@@ -100,6 +96,8 @@ void FrameGraph::Draw() {
         Text("Presenter time: %.3f ms (%.1f FPS)", io.DeltaTime * 1000.0f, 1.0f / io.DeltaTime);
         Text("Flip frame: %d Gnm submit frame: %d", DebugState.flip_frame_count.load(),
              DebugState.gnm_frame_count.load());
+        Text("Draw calls: %.0f   Dispatches: %.0f", DebugState.GetDrawCallsAvg(),
+             DebugState.GetDispatchesAvg());
         Text("Game Res: %dx%d", DebugState.game_resolution.first,
              DebugState.game_resolution.second);
         Text("Output Res: %dx%d", DebugState.output_resolution.first,

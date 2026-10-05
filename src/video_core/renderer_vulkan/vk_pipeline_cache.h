@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <array>
 #include <variant>
 #include <tsl/robin_map.h>
 #include "shader_recompiler/profile.h"
@@ -11,6 +12,7 @@
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
+#include "vulkan/vulkan.hpp"
 
 template <>
 struct std::hash<vk::ShaderModule> {
@@ -45,11 +47,74 @@ struct Program {
     static constexpr size_t MaxPermutations = 8;
     using ModuleList = boost::container::small_vector<Module, MaxPermutations>;
 
+    /// A flattened user data dword a specialization reads a sharp from, and what of it counts.
+    /// Specializations only look at formats, strides, types and such, and at whether a sharp
+    /// is set, not at addresses or sizes, which change from draw to draw with the same
+    /// permutation. Comparing those made most lookups miss.
+    struct SharpDword {
+        u16 index;
+        /// Whether the dword being zero or not counts, apart from the bits in mask.
+        bool nonzero;
+        /// The bits that count.
+        u32 mask;
+
+        bool Same(u32 a, u32 b) const noexcept {
+            return ((a ^ b) & mask) == 0 && (!nonzero || (a == 0) == (b == 0));
+        }
+    };
+
+    /// What a recent lookup of a permutation was given. Draws mostly use a program the way one
+    /// of the few draws before did, and then the permutation is known without building a
+    /// specialization to compare, which took a tenth of the GPU thread.
+    struct LastLookup {
+        bool valid{};
+        size_t perm_idx{};
+        VAddr pgm_base{};
+        Shader::Backend::Bindings start{};
+        Shader::RuntimeInfo runtime_info{};
+        /// The flattened user data dwords listed in sharp_dwords, or all of them without a list.
+        std::vector<u32> user_data;
+        /// The fetch shader and the vertex buffer sharps it loads, which are read from memory
+        /// rather than from the flattened user data.
+        std::vector<u32> fetch_code;
+        std::vector<u32> vertex_sharps;
+
+        bool Matches(const Shader::Info& info, const Shader::RuntimeInfo& runtime_info_,
+                     const Shader::Backend::Bindings& start_,
+                     const Shader::Gcn::FetchShaderData& fetch,
+                     const std::vector<SharpDword>* sharp_dwords) const;
+        void Remember(const Shader::Info& info, const Shader::RuntimeInfo& runtime_info_,
+                      const Shader::Backend::Bindings& start_, size_t perm_idx_,
+                      const Shader::Gcn::FetchShaderData& fetch,
+                      const std::vector<SharpDword>* sharp_dwords);
+    };
+
+    /// Programs drawn with a few materials in turn alternate between as many lookups. With four
+    /// remembered, 15% of lookups in inFAMOUS Second Son's city still missed and built a
+    /// specialization.
+    static constexpr size_t NumLastLookups = 8;
+
     Shader::Info info;
     ModuleList modules{};
+    std::array<LastLookup, NumLastLookups> last_lookups{};
+    size_t next_last_lookup{};
+    /// The flattened user data dwords that specializations read sharps from. The others, like
+    /// pointers and constants that change from draw to draw, can't change the permutation.
+    std::vector<SharpDword> sharp_dwords;
+    bool sharp_dwords_found{};
+    /// Set when a sharp is read from past the flattened user data, so all of it is compared.
+    bool compare_all_dwords{};
+
+    /// Lists the dwords sharps are read from, once the resources of the program are known.
+    void FindSharpDwords();
+
+    /// The dwords lookups compare, or nullptr for all of them.
+    const std::vector<SharpDword>* LookupDwords() const {
+        return compare_all_dwords ? nullptr : &sharp_dwords;
+    }
 
     Program() = default;
-    Program(Shader::Stage stage, Shader::LogicalStage l_stage, Shader::ShaderParams params)
+    Program(Shader::HwStage stage, Shader::SwStage l_stage, Shader::ShaderParams params)
         : info{stage, l_stage, params} {}
 
     void AddPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec) {
@@ -63,10 +128,15 @@ struct Program {
     }
 };
 
+struct DrawIndirectParams {
+    u16 vertex_sgpr_offset;
+    u32 instance_sgpr_offset;
+};
+
 class PipelineCache {
 public:
     explicit PipelineCache(const Instance& instance, Scheduler& scheduler,
-                           AmdGpu::Liverpool* liverpool);
+                           AmdGpu::Liverpool* liverpool, u32 sparse_page_shift);
     ~PipelineCache();
 
     void WarmUp();
@@ -76,21 +146,18 @@ public:
     bool LoadGraphicsPipeline(Serialization::Archive& ar);
     bool LoadPipelineStage(Serialization::Archive& ar, size_t stage);
 
-    const GraphicsPipeline* GetGraphicsPipeline();
+    const GraphicsPipeline* GetGraphicsPipeline(const DrawIndirectParams params = {});
 
     const ComputePipeline* GetComputePipeline();
 
-    using Result = std::tuple<const Shader::Info*, vk::ShaderModule,
-                              std::optional<Shader::Gcn::FetchShaderData>, u64>;
-    Result GetProgram(Shader::Stage stage, Shader::LogicalStage l_stage,
+    using Result = std::tuple<const Shader::Info*, vk::ShaderModule, u64>;
+    Result GetProgram(Shader::HwStage hw_stage, Shader::SwStage sw_stage,
                       const Shader::ShaderParams& params, Shader::Backend::Bindings& binding);
 
     std::optional<vk::ShaderModule> ReplaceShader(vk::ShaderModule module,
                                                   std::span<const u32> spv_code);
 
-    void ReloadAllPatches();
-
-    static std::string GetShaderName(Shader::Stage stage, u64 hash,
+    static std::string GetShaderName(Shader::HwStage stage, u64 hash,
                                      std::optional<size_t> perm = {});
 
     auto& GetProfile() const {
@@ -102,14 +169,17 @@ private:
     bool RefreshGraphicsStages();
     bool RefreshComputeKey();
 
-    void DumpShader(std::span<const u32> code, u64 hash, Shader::Stage stage, size_t perm_idx,
+    void DumpShader(std::span<const u32> code, u64 hash, Shader::HwStage stage, size_t perm_idx,
                     std::string_view ext);
-    std::optional<std::vector<u32>> GetShaderPatch(u64 hash, Shader::Stage stage, size_t perm_idx,
+    std::optional<std::vector<u32>> GetShaderPatch(u64 hash, Shader::HwStage stage, size_t perm_idx,
                                                    std::string_view ext);
     vk::ShaderModule CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
                                    const std::span<const u32>& code, size_t perm_idx,
                                    Shader::Backend::Bindings& binding);
-    const Shader::RuntimeInfo& BuildRuntimeInfo(Shader::Stage stage, Shader::LogicalStage l_stage);
+    const Shader::RuntimeInfo& BuildRuntimeInfo(Shader::HwStage stage, Shader::SwStage l_stage);
+
+    /// Returns the pipeline once it can be used, or null to skip draws while it compiles.
+    const GraphicsPipeline* ReadyGraphicsPipeline(GraphicsPipeline* pipeline);
 
     [[nodiscard]] bool IsPipelineCacheDirty() const {
         return num_new_pipelines > 0;
@@ -124,21 +194,30 @@ private:
     vk::UniquePipelineLayout pipeline_layout;
     Shader::Profile profile{};
     Shader::Pools pools;
+    DrawIndirectParams draw_indirect_params{};
     tsl::robin_map<size_t, std::unique_ptr<Program>> program_cache;
     tsl::robin_map<ComputePipelineKey, std::unique_ptr<ComputePipeline>> compute_pipelines;
     tsl::robin_map<GraphicsPipelineKey, std::unique_ptr<GraphicsPipeline>> graphics_pipelines;
     std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
     std::array<const Shader::Info*, MaxShaderStages> infos{};
     std::array<vk::ShaderModule, MaxShaderStages> modules{};
-    std::optional<Shader::Gcn::FetchShaderData> fetch_shader{};
+    Shader::Gcn::FetchShaderData* fetch_shader{};
     GraphicsPipelineKey graphics_key{};
+    /// The pipeline found last and its key.
+    GraphicsPipelineKey last_graphics_key{};
+    GraphicsPipeline* last_graphics_pipeline{};
     ComputePipelineKey compute_key{};
     u32 num_new_pipelines{}; // new pipelines added to the cache since the game start
+    bool async_shader_compile{};
 
     // Only if Config::collectShadersForDebug()
     tsl::robin_map<vk::ShaderModule,
                    std::vector<std::variant<GraphicsPipelineKey, ComputePipelineKey>>>
         module_related_pipelines;
+
+    // Declared last so it goes first on destruction, dropping queued compiles before the
+    // pipelines and the Vulkan pipeline cache they refer to.
+    std::unique_ptr<PipelineCompiler> compiler;
 };
 
 } // namespace Vulkan

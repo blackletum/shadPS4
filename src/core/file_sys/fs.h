@@ -4,6 +4,7 @@
 #pragma once
 
 #include <atomic>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -13,6 +14,7 @@
 #include "common/logging/formatter.h"
 #include "core/file_sys/devices/base_device.h"
 #include "core/file_sys/directories/base_directory.h"
+#include "core/file_sys/ifile.h"
 
 namespace Libraries::Net {
 struct Socket;
@@ -22,43 +24,79 @@ struct Resolver;
 
 namespace Core::FileSys {
 
-enum class HostPathType { Base, Mod, Patch, Update };
+/// Builds the path of an overlay that sits next to a game
+[[nodiscard]] std::filesystem::path OverlayPath(const std::filesystem::path& base,
+                                                std::string_view suffix);
+
+/// Inverse of OverlayPath.
+[[nodiscard]] std::optional<std::filesystem::path> BaseGameFromOverlay(
+    const std::filesystem::path& path);
+
+[[nodiscard]] std::optional<std::filesystem::path> ResolveGameRoot(
+    const std::filesystem::path& root);
+
+#ifdef _WIN64
+inline constexpr bool NeedsCaseInsensitiveSearch = false;
+#else
+inline constexpr bool NeedsCaseInsensitiveSearch = true;
+#endif
 
 class MntPoints {
-#ifdef _WIN64
-    static constexpr bool NeedsCaseInsensitiveSearch = false;
-#else
-    static constexpr bool NeedsCaseInsensitiveSearch = true;
-#endif
 public:
     static bool ignore_game_patches;
-    static bool enable_mods;
     struct MntPair {
         std::filesystem::path host_path;
         std::string mount; // e.g /app0
         bool read_only;
+        std::vector<std::shared_ptr<IBackend>> backends;
+    };
+
+    enum class HostPathType {
+        Default, // Prioritizes Mod, then patch, then base
+        Base,
+        Patch,
+        Mod
     };
 
     explicit MntPoints() = default;
     ~MntPoints() = default;
 
+    std::shared_ptr<IBackend> CreateBackend(const std::filesystem::path& host_path, bool read_only);
+
     void Mount(const std::filesystem::path& host_folder, const std::string& guest_folder,
                bool read_only = false);
-    void Unmount(const std::filesystem::path& host_folder, const std::string& guest_folder);
+    void Unmount(const std::string& guest_folder);
     void UnmountAll();
-    inline static std::filesystem::path manual_mods_path;
 
     std::filesystem::path GetHostPath(std::string_view guest_directory,
-                                      bool* is_read_only = nullptr, bool force_base_path = false);
-
-    std::filesystem::path ConstructOverlayPath(const MntPair& mount,
-                                               const std::string_view& rel_path,
-                                               HostPathType path_type);
-
+                                      bool* is_read_only = nullptr,
+                                      HostPathType host_path = HostPathType::Default);
     using IterateDirectoryCallback =
         std::function<void(const std::filesystem::path& host_path, bool is_file)>;
     void IterateDirectory(std::string_view guest_directory,
                           const IterateDirectoryCallback& callback);
+
+    /// Returns true if the guest path exists in any backend of the
+    /// mount stack. Mirrors fs::exists() on the resolved host path.
+    bool Exists(std::string_view guest_path);
+
+    /// Returns true if the guest path resolves to a directory in any
+    /// backend of the mount stack.
+    bool IsDirectory(std::string_view guest_path);
+
+    /// Opens the guest path through the mount's backend stack. Returns
+    /// nullptr when the path does not exist or the caller requested
+    /// writable access on a read-only mount.
+    std::unique_ptr<IFile> Open(std::string_view guest_path, bool writable = false);
+    // Open with an explicit host access mode.
+    std::unique_ptr<IFile> Open(std::string_view guest_path, Common::FS::FileAccessMode mode);
+
+    /// Opens a directory through the mount's backend stack.
+    std::unique_ptr<IDirectory> OpenDir(std::string_view guest_path);
+
+    /// open + read the whole file as bytes. Returns nullopt
+    /// when the file does not exist or is unreadable.
+    std::optional<std::vector<u8>> ReadFile(std::string_view guest_path);
 
     const MntPair* GetMountFromHostPath(const std::string& host_path) {
         std::scoped_lock lock{m_mutex};
@@ -68,7 +106,7 @@ public:
         return it == m_mnt_pairs.end() ? nullptr : &*it;
     }
 
-    const std::optional<MntPair> GetMount(const std::string& guest_path) {
+    const MntPair* GetMount(const std::string& guest_path) {
         std::scoped_lock lock{m_mutex};
         const auto it = std::ranges::find_if(m_mnt_pairs, [&](const auto& mount) {
             // When doing starts-with check, add a trailing slash to make sure we don't match
@@ -76,9 +114,9 @@ public:
             return guest_path == mount.mount || guest_path.starts_with(mount.mount + "/");
         });
         if (it == m_mnt_pairs.end()) {
-            return std::nullopt;
+            return nullptr;
         }
-        return *it;
+        return &*it;
     }
 
 private:
@@ -98,19 +136,12 @@ enum class FileType {
     Equeue
 };
 
-enum class StorageClass {
-    Native,
-    App0,
-};
-
 struct File {
     std::atomic_bool is_opened{};
     std::atomic<FileType> type{FileType::Regular};
     std::filesystem::path m_host_name;
     std::string m_guest_name;
-    u64 m_size{};
-    StorageClass storage_class{StorageClass::Native};
-    Common::FS::IOFile f;
+    std::unique_ptr<IFile> handle;
     std::mutex m_mutex;
     std::shared_ptr<Directories::BaseDirectory> directory; // only valid for type == Directory
     std::shared_ptr<Devices::BaseDevice> device;           // only valid for type == Device
@@ -118,10 +149,41 @@ struct File {
     std::shared_ptr<Libraries::Net::Epoll> epoll;          // only valid for type == Epoll
     std::shared_ptr<Libraries::Net::Resolver> resolver;    // only valid for type == Resolver
 
-    // Positional I/O preserving the current file offset; locks m_mutex internally.
-    // Returns bytes transferred, or -1 when the seek fails.
-    s64 PRead(void* buffer, u64 nbytes, u64 offset);
-    s64 PWrite(const void* buffer, u64 nbytes, u64 offset);
+    bool IsBackendOpen() const {
+        return handle && handle->IsOpen();
+    }
+
+    s64 Read(void* dst, u64 size) {
+        return handle ? handle->Read(dst, size) : -1;
+    }
+
+    s64 Write(const void* src, u64 size) {
+        return handle ? handle->Write(src, size) : -1;
+    }
+
+    bool Seek(s64 offset, Common::FS::SeekOrigin origin = Common::FS::SeekOrigin::SetOrigin) {
+        return handle ? handle->Seek(offset, origin) : false;
+    }
+
+    s64 Tell() const {
+        return handle ? static_cast<s64>(handle->Tell()) : -1;
+    }
+
+    u64 GetSize() const {
+        return handle ? handle->Size() : 0;
+    }
+
+    bool Flush() {
+        return handle ? handle->Flush() : false;
+    }
+
+    bool IsWriteOnly() const {
+        return handle ? handle->IsWriteOnly() : false;
+    }
+
+    Common::FS::IOFile* GetHostFile() const {
+        return handle ? handle->GetHostFile() : nullptr;
+    }
 };
 
 class HandleTable {
@@ -131,13 +193,9 @@ public:
 
     int CreateHandle();
     void DeleteHandle(int d);
-    std::shared_ptr<File> TakeHandle(int d);
-    std::shared_ptr<File> GetFileLease(int d);
-    // Returns a raw pointer without extending the file's lifetime: a caller racing close()
-    // can observe a dangling pointer. New call sites should prefer GetFileLease; existing
-    // ones still need to be migrated.
     File* GetFile(int d);
     File* GetSocket(int d);
+    std::vector<int> GetSocketHandles();
     File* GetEpoll(int d);
     File* GetResolver(int d);
     File* GetFile(const std::filesystem::path& host_name);
@@ -146,7 +204,7 @@ public:
     void CreateStdHandles();
 
 private:
-    std::vector<std::shared_ptr<File>> m_files;
+    std::vector<File*> m_files;
     std::mutex m_mutex;
 };
 

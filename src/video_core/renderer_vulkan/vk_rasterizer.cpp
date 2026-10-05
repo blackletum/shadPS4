@@ -1,41 +1,26 @@
-﻿// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <algorithm>
-
-#include "common/config.h"
 #include "common/debug.h"
-#include "common/elf_info.h"
-#include "common/memory_patcher.h"
+#include "common/perf_profiler.h"
+#include "core/debug_state.h"
+#include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/amdgpu/liverpool.h"
+#include "video_core/buffer_cache/buffer.h"
+#include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
-#include "video_core/renderer_vulkan/vk_depth_stencil_state.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
 
-#ifdef MemoryBarrier
-#undef MemoryBarrier
-#endif
-
 namespace Vulkan {
-
-static bool ShouldDisableSync() {
-    const auto& serial = Common::ElfInfo::Instance().GameSerial();
-    return serial == "CUSA03173" || serial == "CUSA00900" || serial == "CUSA00208" ||
-           serial == "CUSA01363" || serial == "CUSA01322" || serial == "CUSA003027" ||
-           serial == "CUSA00299" || serial == "CUSA00207" || serial == "CUSA03014" ||
-           serial == "CUSA03023" || serial == "CUSA03014" || serial == "CUSA00900" ||
-           serial == "CUSA03388" || serial == "CUSA01589" || serial == "CUSA01760" ||
-           serial == "CUSA07439" || serial == "CUSA07339" || serial == "CUSA08692" ||
-           serial == "CUSA08495" || serial == "CUSA50617" || serial == "CUSA18723" ||
-           serial == "CUSA28863" || serial == "CUSA00093" || serial == "CUSA00003";
-}
 
 static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     // TODO(roamic): Add support for multiple viewports and geometry shaders when ViewportIndex
@@ -48,41 +33,39 @@ static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     return push_data;
 }
 
-Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
+/// Builds the key a binding's image is looked up by from everything its descriptor is built from.
+template <size_t... Sizes>
+static auto MakeKey(VideoCore::TextureCache::BindingType type, u32 extra,
+                    const std::array<u32, Sizes>&... parts) {
+    std::array<u32, 2 + (Sizes + ...)> key{};
+    key[0] = static_cast<u32>(type);
+    key[1] = extra;
+    size_t offset = 2;
+    ((std::ranges::copy(parts, key.begin() + offset), offset += Sizes), ...);
+    return key;
+}
+
+Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime& runtime_,
                        AmdGpu::Liverpool* liverpool_)
-    : instance{instance_}, scheduler{scheduler_}, page_manager{this},
-      buffer_cache{instance, scheduler, liverpool_, texture_cache, page_manager},
-      texture_cache{instance, scheduler, liverpool_, buffer_cache, page_manager},
-      storage_sync_{scheduler, buffer_cache, texture_cache},
-      rt_sync_{instance, scheduler, texture_cache}, liverpool{liverpool_},
-      memory{Core::Memory::Instance()}, pipeline_cache{instance, scheduler, liverpool} {
-    if (!Config::nullGpu()) {
+    : instance{instance_}, scheduler{scheduler_}, runtime{runtime_}, page_manager{this},
+      buffer_cache{instance, scheduler, runtime, liverpool_, texture_cache, page_manager},
+      texture_cache{instance, scheduler, runtime, liverpool_, buffer_cache, page_manager},
+      liverpool{liverpool_}, memory{Core::Memory::Instance()},
+      pipeline_cache{instance, scheduler, liverpool, buffer_cache.GetSparsePageShift()},
+      host_markers_enabled{EmulatorSettings.IsVkHostMarkersEnabled()},
+      guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()} {
+    if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
     }
     memory->SetRasterizer(this);
+
+    scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
+        runtime.FlushBarriers();
+        buffer_cache.SubmitPendingArenaBinds(info);
+    });
 }
 
 Rasterizer::~Rasterizer() = default;
-// Get the current color buffer image for screenshot capture
-VideoCore::ImageId Rasterizer::GetCurrentColorBuffer(u32 index) const {
-    if (index < AmdGpu::NUM_COLOR_BUFFERS) {
-        return cb_descs[index].first;
-    }
-    return VideoCore::ImageId{};
-}
-
-void Rasterizer::CpSync() {
-    scheduler.EndRendering();
-    auto cmdbuf = scheduler.CommandBuffer();
-
-    const vk::MemoryBarrier ib_barrier{
-        .srcAccessMask = vk::AccessFlagBits::eShaderWrite,
-        .dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead,
-    };
-    cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eComputeShader,
-                           vk::PipelineStageFlagBits::eDrawIndirect,
-                           vk::DependencyFlagBits::eByRegion, ib_barrier, {}, {});
-}
 
 bool Rasterizer::FilterDraw() {
     const auto& regs = liverpool->regs;
@@ -135,6 +118,34 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
     // Prefetch render targets to handle overlaps with bound textures (e.g. mipgen)
     const auto& key = pipeline->GetGraphicsKey();
     const auto& regs = liverpool->regs;
+
+    // Draws mostly render to the targets the draw before them did. With the registers they are
+    // found from and the images in the cache unchanged, the same images are found again, and
+    // building the key and descriptor of each target to look them up was a part of every draw.
+    RenderTargetInputs inputs{
+        .regs_version = liverpool->context_regs_version,
+        .image_generation = texture_cache.ImageGeneration(),
+        .db_extent = liverpool->last_db_extent.raw,
+        .mrt_mask = key.mrt_mask,
+    };
+    for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+        inputs.cb_extents[cb] = liverpool->last_cb_extent[cb].raw;
+    }
+    if (inputs == last_render_target_inputs) {
+        const auto bind_target = [&](VideoCore::ImageId image_id) {
+            if (image_id) {
+                bound_images.emplace_back(image_id);
+                texture_cache.GetImage(image_id).binding.is_target = 1u;
+            }
+        };
+        for (s32 cb = 0; cb < std::bit_width(key.mrt_mask); ++cb) {
+            bind_target(cb_descs[cb].image_id);
+        }
+        bind_target(db_desc.first);
+        return;
+    }
+    last_render_target_inputs = inputs;
+
     if (regs.color_control.degamma_enable) {
         LOG_WARNING(Render_Vulkan, "Color buffers require gamma correction");
     }
@@ -150,20 +161,30 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
             continue;
         }
         const auto& hint = liverpool->last_cb_extent[cb];
-        std::construct_at(&desc, col_buf, hint);
-        image_id = bound_images.emplace_back(texture_cache.FindImage(desc));
+        const auto key = MakeKey(VideoCore::TextureCache::BindingType::RenderTarget, hint.raw,
+                                 std::bit_cast<std::array<u32, sizeof(col_buf) / 4>>(col_buf));
+        image_id = bound_images.emplace_back(texture_cache.FindImageCached(
+            key, desc, [&](auto& new_desc) { std::construct_at(&new_desc, col_buf, hint); }));
         auto& image = texture_cache.GetImage(image_id);
         image.binding.is_target = 1u;
     }
 
-    const auto depth_stencil = GetEffectiveDepthStencilState(regs);
-    if (depth_stencil.needs_attachment) {
+    if ((regs.depth_control.depth_enable && regs.depth_buffer.DepthValid()) ||
+        (regs.depth_control.stencil_enable && regs.depth_buffer.StencilValid())) {
         const auto htile_address = regs.depth_htile_data_base.GetAddress();
         const auto& hint = liverpool->last_db_extent;
         auto& [image_id, desc] = db_desc;
-        std::construct_at(&desc, regs.depth_buffer, regs.depth_view, regs.depth_control,
-                          htile_address, hint);
-        image_id = bound_images.emplace_back(texture_cache.FindImage(desc));
+        const auto key = MakeKey(
+            VideoCore::TextureCache::BindingType::DepthTarget, hint.raw,
+            std::bit_cast<std::array<u32, sizeof(regs.depth_buffer) / 4>>(regs.depth_buffer),
+            std::array<u32, 4>{
+                std::bit_cast<u32>(regs.depth_view), u32{regs.depth_control.depth_write_enable},
+                static_cast<u32>(htile_address), static_cast<u32>(htile_address >> 32)});
+        image_id =
+            bound_images.emplace_back(texture_cache.FindImageCached(key, desc, [&](auto& new_desc) {
+                std::construct_at(&new_desc, regs.depth_buffer, regs.depth_view, regs.depth_control,
+                                  htile_address, hint);
+            }));
         auto& image = texture_cache.GetImage(image_id);
         image.binding.is_target = 1u;
     } else {
@@ -171,17 +192,16 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
     }
 }
 
-static std::pair<u32, u32> GetDrawOffsets(
-    const AmdGpu::Regs& regs, const Shader::Info& info,
-    const std::optional<Shader::Gcn::FetchShaderData>& fetch_shader) {
+static std::pair<u32, u32> GetDrawOffsets(const AmdGpu::Regs& regs, const Shader::Info& info,
+                                          const Shader::Gcn::FetchShaderData& fetch_shader) {
     u32 vertex_offset = regs.index_offset;
     u32 instance_offset = 0;
-    if (fetch_shader) {
-        if (vertex_offset == 0 && fetch_shader->vertex_offset_sgpr != -1) {
-            vertex_offset = info.user_data[fetch_shader->vertex_offset_sgpr];
+    if (!fetch_shader.Empty()) {
+        if (vertex_offset == 0 && fetch_shader.vertex_offset_sgpr != -1) {
+            vertex_offset = info.user_data[fetch_shader.vertex_offset_sgpr];
         }
-        if (fetch_shader->instance_offset_sgpr != -1) {
-            instance_offset = info.user_data[fetch_shader->instance_offset_sgpr];
+        if (fetch_shader.instance_offset_sgpr != -1) {
+            instance_offset = info.user_data[fetch_shader.instance_offset_sgpr];
         }
     }
     return {vertex_offset, instance_offset};
@@ -206,7 +226,7 @@ void Rasterizer::EliminateFastClear() {
 
     ScopeMarkerBegin(fmt::format("EliminateFastClear:MRT={:#x}:M={:#x}", col_buf.Address(),
                                  col_buf.CmaskAddress()));
-    image.Clear(clear_value, desc.view_info.range);
+    runtime.ClearImage(&image, desc.view_info.range, clear_value);
     ScopeMarkerEnd();
 }
 
@@ -230,22 +250,33 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         return;
     }
     const auto state = BeginRendering(pipeline);
+    // Before anything of the draw itself is recorded, which has to go with it.
+    scheduler.SubmitIfWorkPiledUp(state);
+    scheduler.CountWork();
 
-    buffer_cache.BindVertexBuffers(*pipeline, buffer_barriers);
+    BindVertexBuffers(pipeline);
     if (is_indexed) {
-        buffer_cache.BindIndexBuffer(index_offset, buffer_barriers);
+        BindIndexBuffer(index_offset);
     }
 
-    pipeline->BindResources(set_writes, buffer_barriers, push_data);
+    scheduler.MarkWorkRun(false);
+    if (needs_barrier) {
+        if (last_work_compute) {
+            Common::Perf::Count(Common::Perf::Counter::SwitchBarriers);
+        }
+        runtime.FlushBarriers();
+    }
+
+    pipeline->BindResources(set_writes, push_data);
     UpdateDynamicState(pipeline, is_indexed);
     scheduler.BeginRendering(state);
 
-    const auto& vs_info = pipeline->GetStage(Shader::LogicalStage::Vertex);
+    const auto& vs_info = pipeline->GetStage(Shader::SwStage::Vertex);
     const auto& fetch_shader = pipeline->GetFetchShader();
     const auto [vertex_offset, instance_offset] = GetDrawOffsets(regs, vs_info, fetch_shader);
 
     const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
+    scheduler.GetDynamicState().BindGraphicsPipeline(cmdbuf, pipeline->Handle());
 
     if (is_indexed) {
         cmdbuf.drawIndexed(regs.num_indices, regs.num_instances.NumInstances(), 0,
@@ -254,12 +285,18 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         cmdbuf.draw(regs.num_indices, regs.num_instances.NumInstances(), vertex_offset,
                     instance_offset);
     }
+    DebugState.IncDrawCall();
+    Common::Perf::Count(Common::Perf::Counter::Draws);
+    if (std::exchange(last_work_compute, false)) {
+        Common::Perf::Count(Common::Perf::Counter::WorkSwitches);
+    }
 
-    ResetBindings();
+    ResetBindings(false);
 }
 
 void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u32 stride,
-                              u32 max_count, VAddr count_address) {
+                              u32 max_count, VAddr count_address, u16 vertex_sgpr_offset,
+                              u16 instance_sgpr_offset) {
     RENDERER_TRACE;
 
     scheduler.PopPendingOperations();
@@ -268,7 +305,11 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         return;
     }
 
-    const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline();
+    const DrawIndirectParams params = {
+        .vertex_sgpr_offset = vertex_sgpr_offset,
+        .instance_sgpr_offset = instance_sgpr_offset,
+    };
+    const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline(params);
     if (!pipeline) {
         return;
     }
@@ -278,74 +319,71 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         return;
     }
     const auto state = BeginRendering(pipeline);
+    // Before anything of the draw itself is recorded, which has to go with it.
+    scheduler.SubmitIfWorkPiledUp(state);
+    scheduler.CountWork();
 
-    buffer_cache.BindVertexBuffers(*pipeline, buffer_barriers);
+    BindVertexBuffers(pipeline);
     if (is_indexed) {
-        buffer_cache.BindIndexBuffer(0, buffer_barriers);
+        BindIndexBuffer();
     }
 
-    const auto& [buffer, base] =
-        buffer_cache.ObtainBuffer(arg_address + offset, stride * max_count);
+    const auto [buffer, base] =
+        buffer_cache.ObtainBuffer(arg_address + offset, stride * max_count, false);
+    needs_barrier |= runtime.IsBufferAccessed(buffer, base, stride * max_count);
+    runtime.NoteBufferRead(buffer, base, stride * max_count);
 
-    VideoCore::Buffer* count_buffer{};
-    u32 count_base{};
+    const VideoCore::Buffer* count_buffer;
+    u64 count_offset;
     if (count_address != 0) {
-        std::tie(count_buffer, count_base) = buffer_cache.ObtainBuffer(count_address, 4);
+        std::tie(count_buffer, count_offset) = buffer_cache.ObtainBuffer(count_address, 4, false);
+        needs_barrier |= runtime.IsBufferAccessed(count_buffer, count_offset, 4);
+        runtime.NoteBufferRead(count_buffer, count_offset, 4);
     }
 
-    if (auto barrier = buffer->GetBarrier(vk::AccessFlagBits2::eIndirectCommandRead,
-                                          vk::PipelineStageFlagBits2::eDrawIndirect)) {
-        buffer_barriers.emplace_back(*barrier);
-    }
-    if (count_buffer) {
-        if (auto barrier = count_buffer->GetBarrier(vk::AccessFlagBits2::eIndirectCommandRead,
-                                                    vk::PipelineStageFlagBits2::eDrawIndirect)) {
-            buffer_barriers.emplace_back(*barrier);
+    scheduler.MarkWorkRun(false);
+    if (needs_barrier) {
+        if (last_work_compute) {
+            Common::Perf::Count(Common::Perf::Counter::SwitchBarriers);
         }
+        runtime.FlushBarriers();
     }
 
-    if (auto barrier = buffer->GetBarrier(vk::AccessFlagBits2::eIndirectCommandRead,
-                                          vk::PipelineStageFlagBits2::eDrawIndirect)) {
-        buffer_barriers.emplace_back(*barrier);
-    }
-    if (count_buffer) {
-        if (auto barrier = count_buffer->GetBarrier(vk::AccessFlagBits2::eIndirectCommandRead,
-                                                    vk::PipelineStageFlagBits2::eDrawIndirect)) {
-            buffer_barriers.emplace_back(*barrier);
-        }
-    }
-
-    pipeline->BindResources(set_writes, buffer_barriers, push_data);
+    pipeline->BindResources(set_writes, push_data);
     UpdateDynamicState(pipeline, is_indexed);
     scheduler.BeginRendering(state);
 
-    // We can safely ignore both SGPR UD indices and results of fetch shader parsing, as vertex and
-    // instance offsets will be automatically applied by Vulkan from indirect args buffer.
-
     const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
+    scheduler.GetDynamicState().BindGraphicsPipeline(cmdbuf, pipeline->Handle());
 
     if (is_indexed) {
         ASSERT(sizeof(VkDrawIndexedIndirectCommand) == stride);
 
         if (count_address != 0) {
             cmdbuf.drawIndexedIndirectCount(buffer->Handle(), base, count_buffer->Handle(),
-                                            count_base, max_count, stride);
+                                            count_offset, max_count, stride);
         } else {
             cmdbuf.drawIndexedIndirect(buffer->Handle(), base, max_count, stride);
         }
+        DebugState.IncDrawCall();
+        Common::Perf::Count(Common::Perf::Counter::Draws);
     } else {
         ASSERT(sizeof(VkDrawIndirectCommand) == stride);
 
         if (count_address != 0) {
-            cmdbuf.drawIndirectCount(buffer->Handle(), base, count_buffer->Handle(), count_base,
+            cmdbuf.drawIndirectCount(buffer->Handle(), base, count_buffer->Handle(), count_offset,
                                      max_count, stride);
         } else {
             cmdbuf.drawIndirect(buffer->Handle(), base, max_count, stride);
         }
+        DebugState.IncDrawCall();
+        Common::Perf::Count(Common::Perf::Counter::Draws);
+    }
+    if (std::exchange(last_work_compute, false)) {
+        Common::Perf::Count(Common::Perf::Counter::WorkSwitches);
     }
 
-    ResetBindings();
+    ResetBindings(false);
 }
 
 void Rasterizer::DispatchDirect() {
@@ -359,7 +397,7 @@ void Rasterizer::DispatchDirect() {
         return;
     }
 
-    const auto& cs = pipeline->GetStage(Shader::LogicalStage::Compute);
+    const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
     if (ExecuteShaderHLE(cs, liverpool->regs, cs_program, *this)) {
         return;
     }
@@ -368,22 +406,31 @@ void Rasterizer::DispatchDirect() {
         return;
     }
 
+    scheduler.MarkWorkRun(true);
+    if (needs_barrier) {
+        if (!last_work_compute) {
+            Common::Perf::Count(Common::Perf::Counter::SwitchBarriers);
+        }
+        runtime.FlushBarriers();
+    }
+
     scheduler.EndRendering();
-    pipeline->BindResources(set_writes, buffer_barriers, push_data);
+    pipeline->BindResources(set_writes, push_data);
 
     const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
+    scheduler.GetDynamicState().BindComputePipeline(cmdbuf, pipeline->Handle());
     cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
-
-    if (!ShouldDisableSync()) {
-        for (const auto& storage_image_id : pending_storage_image_ids_) {
-            storage_sync_.Sync(storage_image_id);
-        }
+    DebugState.IncDispatch();
+    Common::Perf::Count(Common::Perf::Counter::Dispatches);
+    if (!std::exchange(last_work_compute, true)) {
+        Common::Perf::Count(Common::Perf::Counter::WorkSwitches);
     }
-    ResetBindings();
+    scheduler.CountWork();
+
+    ResetBindings(true);
 }
 
-void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, bool on_gpu) {
+void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     RENDERER_TRACE;
 
     scheduler.PopPendingOperations();
@@ -398,27 +445,32 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size, bool on_g
         return;
     }
 
-    const auto [buffer, base] =
-        buffer_cache.ObtainBuffer(address + offset, size, VideoCore::ObtainBufferFlags::IsWritten);
+    const auto [buffer, base] = buffer_cache.ObtainBuffer(address + offset, size, false);
+    needs_barrier |= runtime.IsBufferAccessed(buffer, base, size);
+    runtime.NoteBufferRead(buffer, base, size);
 
-    if (auto barrier = buffer->GetBarrier(vk::AccessFlagBits2::eIndirectCommandRead,
-                                          vk::PipelineStageFlagBits2::eDrawIndirect)) {
-        buffer_barriers.emplace_back(*barrier);
+    scheduler.MarkWorkRun(true);
+    if (needs_barrier) {
+        if (!last_work_compute) {
+            Common::Perf::Count(Common::Perf::Counter::SwitchBarriers);
+        }
+        runtime.FlushBarriers();
     }
 
     scheduler.EndRendering();
-    pipeline->BindResources(set_writes, buffer_barriers, push_data);
+    pipeline->BindResources(set_writes, push_data);
 
     const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
+    scheduler.GetDynamicState().BindComputePipeline(cmdbuf, pipeline->Handle());
     cmdbuf.dispatchIndirect(buffer->Handle(), base);
-
-    if (!ShouldDisableSync()) {
-        for (const auto& storage_image_id : pending_storage_image_ids_) {
-            storage_sync_.Sync(storage_image_id);
-        }
+    DebugState.IncDispatch();
+    Common::Perf::Count(Common::Perf::Counter::Dispatches);
+    if (!std::exchange(last_work_compute, true)) {
+        Common::Perf::Count(Common::Perf::Counter::WorkSwitches);
     }
-    ResetBindings();
+    scheduler.CountWork();
+
+    ResetBindings(true);
 }
 
 u64 Rasterizer::Flush() {
@@ -433,31 +485,15 @@ void Rasterizer::Finish() {
 }
 
 void Rasterizer::OnSubmit() {
-    if (fault_process_pending) {
-        fault_process_pending = false;
-        buffer_cache.ProcessFaultBuffer();
-    }
+    buffer_cache.TickFrame();
     texture_cache.ProcessDownloadImages();
-    buffer_cache.ProcessPreemptiveDownloads();
-
-    if (!ShouldDisableSync()) {
-        rt_sync_.ClearRecords();
-    }
-
-    static u64 gc_timer = 0;
-    if (++gc_timer > 60) {
-        gc_timer = 0;
-        const u64 used_mem = instance.GetDeviceMemoryUsage();
-        const u64 trigger = texture_cache.GetTriggerGcMemory();
-        if (used_mem > trigger) {
-            texture_cache.RunGarbageCollectorAsync();
-            buffer_cache.RunGarbageCollectorAsync();
-        }
-    }
+    texture_cache.RunGarbageCollector();
+    runtime.TickFrame();
 }
 
-void Rasterizer::CommitPendingGpuRanges() {
-    buffer_cache.CommitPendingGpuRanges();
+void Rasterizer::OnFence() {
+    texture_cache.ProcessDownloadImages();
+    buffer_cache.PrefetchReadbacks();
 }
 
 bool Rasterizer::BindResources(const Pipeline* pipeline) {
@@ -466,11 +502,8 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         return false;
     }
 
-    pending_storage_image_ids_.clear();
-
     set_write_index = 0;
     set_writes.clear();
-    buffer_barriers.clear();
     buffer_infos.clear();
     image_infos.clear();
 
@@ -485,22 +518,175 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
         }
         set_writes.resize(set_writes.size() + stage->buffers.size() + stage->images.size() +
                           stage->samplers.size());
-        stage->PushUd(binding, push_data);
         BindBuffers(*stage, binding, push_data);
         BindTextures(*stage, binding);
         uses_dma |= stage->uses_dma;
     }
 
     if (uses_dma) {
-        // We only use fault buffer for DMA right now.
-        Common::RecursiveSharedLock lock{mapped_ranges_mutex};
-        for (auto& range : mapped_ranges) {
-            buffer_cache.SynchronizeBuffersInRange(range.lower(), range.upper() - range.lower());
-        }
-        fault_process_pending = true;
+        buffer_cache.SynchronizeDmaBuffers();
+        // Its shaders read memory through addresses, which no access is kept for. Noted once
+        // the draw is recorded, as a submit can come in between.
+        untracked_access = true;
     }
 
     return true;
+}
+
+void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
+    const auto& regs = liverpool->regs;
+    VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
+    VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
+    VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT> divisors;
+    VertexInputs<AmdGpu::Buffer> guest_buffers;
+    pipeline->GetVertexInputs(attributes, bindings, divisors, guest_buffers,
+                              regs.vgt_instance_step_rate_0, regs.vgt_instance_step_rate_1);
+
+    if (instance.IsVertexInputDynamicState()) {
+        // Update current vertex inputs. Draws mostly use the inputs the draw before did, and
+        // setting them again for every draw took a good part of its time in the driver.
+        auto& dirty = scheduler.GetDynamicState().dirty_state;
+        if (dirty.vertex_input || bindings != last_vertex_bindings ||
+            attributes != last_vertex_attributes) {
+            const auto cmdbuf = scheduler.CommandBuffer();
+            cmdbuf.setVertexInputEXT(bindings, attributes);
+            last_vertex_bindings = bindings;
+            last_vertex_attributes = attributes;
+            dirty.vertex_input = false;
+        }
+    }
+
+    if (bindings.empty()) {
+        // If there are no bindings, there is nothing further to do.
+        return;
+    }
+
+    struct BufferRange {
+        VAddr base_address;
+        VAddr end_address;
+        const VideoCore::Buffer* buffer;
+        u64 offset;
+
+        [[nodiscard]] size_t GetSize() const {
+            return end_address - base_address;
+        }
+    };
+
+    // Build list of ranges covering the requested buffers
+    VertexInputs<BufferRange> ranges{};
+    for (const auto& buffer : guest_buffers) {
+        if (buffer.base_address != 0 && buffer.GetSize() > 0) {
+            ranges.emplace_back(buffer.base_address, buffer.base_address + buffer.GetSize());
+        }
+    }
+
+    // Merge connecting ranges together
+    VertexInputs<BufferRange> ranges_merged{};
+    if (!ranges.empty()) {
+        std::ranges::sort(ranges, [](const BufferRange& lhv, const BufferRange& rhv) {
+            return lhv.base_address < rhv.base_address;
+        });
+        ranges_merged.emplace_back(ranges[0]);
+        for (auto range : ranges) {
+            auto& prev_range = ranges_merged.back();
+            if (prev_range.end_address < range.base_address) {
+                ranges_merged.emplace_back(range);
+            } else {
+                prev_range.end_address = std::max(prev_range.end_address, range.end_address);
+            }
+        }
+    }
+
+    // Map buffers for merged ranges. Their reads are reported to the runtime with the bound
+    // buffers after the draw, so an upload over them waits for it.
+    for (auto& range : ranges_merged) {
+        const u64 size = memory->ClampRangeSize(range.base_address, range.GetSize());
+        std::tie(range.buffer, range.offset) =
+            buffer_cache.ObtainBuffer(range.base_address, size, false, false, true);
+        needs_barrier |= runtime.IsBufferAccessed(range.buffer, range.offset, size);
+        bound_buffers.emplace_back(range.buffer, range.offset, static_cast<u32>(size), false);
+    }
+
+    // Bind vertex buffers
+    VertexInputs<vk::Buffer> host_buffers;
+    VertexInputs<vk::DeviceSize> host_offsets;
+    VertexInputs<vk::DeviceSize> host_sizes;
+    VertexInputs<vk::DeviceSize> host_strides;
+    for (const auto& buffer : guest_buffers) {
+        if (buffer.base_address != 0 && buffer.GetSize() > 0) {
+            const auto host_buffer_info =
+                std::ranges::find_if(ranges_merged, [&](const BufferRange& range) {
+                    return buffer.base_address >= range.base_address &&
+                           buffer.base_address < range.end_address;
+                });
+            ASSERT(host_buffer_info != ranges_merged.cend());
+            host_buffers.emplace_back(host_buffer_info->buffer->Handle());
+            host_offsets.push_back(host_buffer_info->offset + buffer.base_address -
+                                   host_buffer_info->base_address);
+        } else {
+            host_buffers.emplace_back(VK_NULL_HANDLE);
+            host_offsets.push_back(0);
+        }
+        host_sizes.push_back(buffer.GetSize());
+        host_strides.push_back(buffer.GetStride());
+    }
+
+    const auto cmdbuf = scheduler.CommandBuffer();
+    const auto num_buffers = guest_buffers.size();
+    if (instance.IsVertexInputDynamicState()) {
+        cmdbuf.bindVertexBuffers(0, num_buffers, host_buffers.data(), host_offsets.data());
+    } else {
+        cmdbuf.bindVertexBuffers2(0, num_buffers, host_buffers.data(), host_offsets.data(),
+                                  host_sizes.data(), host_strides.data());
+    }
+}
+
+void Rasterizer::BindIndexBuffer(u32 index_offset) {
+    const auto& regs = liverpool->regs;
+
+    // Figure out index type and size.
+    const bool is_index16 = regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16;
+    const vk::IndexType index_type = is_index16 ? vk::IndexType::eUint16 : vk::IndexType::eUint32;
+    const u32 index_size = is_index16 ? sizeof(u16) : sizeof(u32);
+    const VAddr index_address =
+        regs.index_base_address.Address<VAddr>() + index_offset * index_size;
+
+    // Bind index buffer.
+    const u32 index_buffer_size = regs.num_indices * index_size;
+    const auto [buffer, offset] =
+        buffer_cache.ObtainBuffer(index_address, index_buffer_size, false, false, true);
+    needs_barrier |= runtime.IsBufferAccessed(buffer, offset, index_buffer_size);
+    if (index_buffer_size != 0) {
+        bound_buffers.emplace_back(buffer, offset, index_buffer_size, false);
+    }
+    const auto cmdbuf = scheduler.CommandBuffer();
+    cmdbuf.bindIndexBuffer(buffer->Handle(), offset, index_type);
+}
+
+void Rasterizer::ResetBindings(bool is_compute) {
+    for (auto& image_id : bound_images) {
+        texture_cache.GetImage(image_id).binding = {};
+    }
+    const VideoCore::Buffer* stream_buffer = &buffer_cache.GetStreamBuffer();
+    for (const auto [buffer, offset, size, is_written] : bound_buffers) {
+        // Stream buffer memory is only written again once the GPU is done with it, so reads of
+        // it need no tracking, and most small buffers are read from there.
+        if (buffer == stream_buffer && !is_written) {
+            continue;
+        }
+        const auto dst_stage = is_compute ? vk::PipelineStageFlagBits2::eComputeShader
+                                          : vk::PipelineStageFlagBits2::eAllGraphics;
+        const auto write_flag =
+            is_written ? vk::AccessFlagBits2::eShaderWrite : vk::AccessFlagBits2::eNone;
+        runtime.AccessBuffer(buffer, offset, size, dst_stage,
+                             vk::AccessFlagBits2::eShaderRead | write_flag);
+    }
+    if (std::exchange(untracked_access, false)) {
+        runtime.NoteUntrackedAccess();
+    }
+    bound_images.clear();
+    bound_buffers.clear();
+    needs_barrier = false;
 }
 
 bool Rasterizer::IsComputeMetaClear(const Pipeline* pipeline) {
@@ -512,7 +698,7 @@ bool Rasterizer::IsComputeMetaClear(const Pipeline* pipeline) {
     // we can skip the whole dispatch and update the tracked state instead. Also, it is not
     // intended to be consumed and in such rare cases (e.g. HTile introspection, CRAA) we
     // will need its full emulation anyways.
-    const auto& info = pipeline->GetStage(Shader::LogicalStage::Compute);
+    const auto& info = pipeline->GetStage(Shader::SwStage::Compute);
 
     // Assume if a shader reads metadata, it is a copy shader.
     for (const auto& desc : info.buffers) {
@@ -547,7 +733,7 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline) {
 
     // Ensure shader only has 2 bound buffers
     const auto& cs_pgm = liverpool->GetCsRegs();
-    const auto& info = pipeline->GetStage(Shader::LogicalStage::Compute);
+    const auto& info = pipeline->GetStage(Shader::SwStage::Compute);
     if (cs_pgm.num_thread_x.full != 64 || info.buffers.size() != 2 || !info.images.empty()) {
         return false;
     }
@@ -589,16 +775,7 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline) {
     // Perform image copy
     VideoCore::Image& src_image = desc0.is_written ? image1 : image0;
     VideoCore::Image& dst_image = desc0.is_written ? image0 : image1;
-    if (instance.IsMaintenance8Supported() ||
-        src_image.info.props.is_depth == dst_image.info.props.is_depth) {
-        dst_image.CopyImage(src_image);
-    } else {
-        const auto& copy_buffer =
-            buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::DeviceLocal);
-        dst_image.CopyImageWithBuffer(src_image, copy_buffer.Handle(), 0);
-    }
-    dst_image.flags |= VideoCore::ImageFlagBits::GpuModified;
-    dst_image.flags &= ~VideoCore::ImageFlagBits::Dirty;
+    runtime.CopyColorAndDepth(&src_image, &dst_image);
     return true;
 }
 
@@ -609,7 +786,7 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
 
     // Ensure shader only has 2 bound buffers
     const auto& cs_pgm = liverpool->GetCsRegs();
-    const auto& info = pipeline->GetStage(Shader::LogicalStage::Compute);
+    const auto& info = pipeline->GetStage(Shader::SwStage::Compute);
     if (cs_pgm.num_thread_x.full != 64 || info.buffers.size() != 2 || !info.images.empty()) {
         return false;
     }
@@ -656,45 +833,46 @@ bool Rasterizer::IsComputeImageClear(const Pipeline* pipeline) {
             },
         .extent = image1.info.resources,
     };
-    image1.Clear(clear, range);
-    image1.flags |= VideoCore::ImageFlagBits::GpuModified;
-    image1.flags &= ~VideoCore::ImageFlagBits::Dirty;
+    runtime.ClearImage(&image1, range, clear);
     return true;
 }
 
 void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                              Shader::PushData& push_data) {
-    buffer_bindings.clear();
-
+    const u64 alignment = instance.StorageMinAlignment();
     for (const auto& desc : stage.buffers) {
-        const auto vsharp = desc.GetSharp(stage);
-        if (!desc.IsSpecial() && vsharp.base_address != 0 && vsharp.GetSize() > 0) {
-            const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
-            const auto buffer_id = buffer_cache.FindBuffer(vsharp.base_address, size);
-            buffer_bindings.emplace_back(buffer_id, vsharp, size);
-        } else {
-            buffer_bindings.emplace_back(VideoCore::BufferId{}, vsharp, 0);
-        }
-    }
-
-    // Second pass to re-bind buffers that were updated after binding
-    for (u32 i = 0; i < buffer_bindings.size(); i++) {
-        const auto& [buffer_id, vsharp, size] = buffer_bindings[i];
-        const auto& desc = stage.buffers[i];
-        const bool is_storage = desc.IsStorage(vsharp);
-        const u32 alignment =
-            is_storage ? instance.StorageMinAlignment() : instance.UniformMinAlignment();
-        // Buffer is not from the cache, either a special buffer or unbound.
-        if (!buffer_id) {
+        if (desc.IsSpecial()) {
             if (desc.buffer_type == Shader::BufferType::GdsBuffer) {
                 const auto* gds_buf = buffer_cache.GetGdsBuffer();
                 buffer_infos.emplace_back(gds_buf->Handle(), 0, gds_buf->SizeBytes());
+                needs_barrier |=
+                    runtime.IsBufferAccessed(gds_buf, 0, gds_buf->SizeBytes(), desc.is_written);
+                bound_buffers.emplace_back(gds_buf, 0, gds_buf->SizeBytes(), desc.is_written);
             } else if (desc.buffer_type == Shader::BufferType::Flatbuf) {
-                auto& vk_buffer = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream);
+                auto& vk_buffer = buffer_cache.GetStreamBuffer();
                 const u32 ubo_size = stage.flattened_ud_buf.size() * sizeof(u32);
                 const u64 offset =
                     vk_buffer.Copy(stage.flattened_ud_buf.data(), ubo_size, alignment);
                 buffer_infos.emplace_back(vk_buffer.Handle(), offset, ubo_size);
+            } else if (desc.buffer_type == Shader::BufferType::ClipPlanes) {
+                // Permutations compiled without enabled planes never read the buffer, so the
+                // declared binding is satisfied with a null descriptor instead of a copy.
+                if (liverpool->regs.clipper_control.user_clip_plane_enable == 0) {
+                    buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
+                } else {
+                    auto& vk_buffer = buffer_cache.GetStreamBuffer();
+                    std::array<float, AmdGpu::NUM_CLIP_PLANES * 4> planes{};
+                    for (u32 i = 0; i < AmdGpu::NUM_CLIP_PLANES; ++i) {
+                        const auto& plane = liverpool->regs.clip_user_data[i];
+                        planes[i * 4 + 0] = std::bit_cast<float>(plane.data_x);
+                        planes[i * 4 + 1] = std::bit_cast<float>(plane.data_y);
+                        planes[i * 4 + 2] = std::bit_cast<float>(plane.data_z);
+                        planes[i * 4 + 3] = std::bit_cast<float>(plane.data_w);
+                    }
+                    const u32 ubo_size = static_cast<u32>(sizeof(planes));
+                    const u64 offset = vk_buffer.Copy(planes.data(), ubo_size, alignment);
+                    buffer_infos.emplace_back(vk_buffer.Handle(), offset, ubo_size);
+                }
             } else if (desc.buffer_type == Shader::BufferType::BdaPagetable) {
                 const auto* bda_buffer = buffer_cache.GetBdaPageTableBuffer();
                 buffer_infos.emplace_back(bda_buffer->Handle(), 0, bda_buffer->SizeBytes());
@@ -702,40 +880,45 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 const auto* fault_buffer = buffer_cache.GetFaultBuffer();
                 buffer_infos.emplace_back(fault_buffer->Handle(), 0, fault_buffer->SizeBytes());
             } else if (desc.buffer_type == Shader::BufferType::SharedMemory) {
-                auto& lds_buffer = buffer_cache.GetUtilityBuffer(VideoCore::MemoryUsage::Stream);
+                auto& lds_buffer = buffer_cache.GetStreamBuffer();
                 const auto& cs_program = liverpool->GetCsRegs();
                 const auto lds_size = cs_program.SharedMemSize() * cs_program.NumWorkgroups();
+                Common::Perf::Count(Common::Perf::Counter::SharedMemoryDispatches);
+                Common::Perf::Count(Common::Perf::Counter::SharedMemoryBytes, lds_size);
                 const auto [data, offset] = lds_buffer.Map(lds_size, alignment);
                 std::memset(data, 0, lds_size);
+                lds_buffer.Commit();
                 buffer_infos.emplace_back(lds_buffer.Handle(), offset, lds_size);
             } else {
-                buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
+                UNREACHABLE_MSG("Unexpected buffer type {}", u32(desc.buffer_type));
             }
         } else {
-            VideoCore::ObtainBufferFlags flags = {};
-            if (desc.is_written) {
-                flags |= VideoCore::ObtainBufferFlags::IsWritten;
-            }
-            if (desc.is_formatted) {
-                flags |= VideoCore::ObtainBufferFlags::IsTexelBuffer;
-            }
-            const auto [vk_buffer, offset] =
-                buffer_cache.ObtainBuffer(vsharp.base_address, size, flags, buffer_id);
-            const u32 offset_aligned = Common::AlignDown(offset, alignment);
-            const u32 adjust = offset - offset_aligned;
-            if (!MemoryPatcher::IsSpecialCusa()) {
-                ASSERT(adjust % 4 == 0);
-            }
-            push_data.AddOffset(binding.buffer, adjust);
-            buffer_infos.emplace_back(vk_buffer->Handle(), offset_aligned, size + adjust);
-            if (auto barrier =
-                    vk_buffer->GetBarrier(desc.is_written ? vk::AccessFlagBits2::eShaderWrite
-                                                          : vk::AccessFlagBits2::eShaderRead,
-                                          vk::PipelineStageFlagBits2::eAllCommands)) {
-                buffer_barriers.emplace_back(*barrier);
-            }
-            if (desc.is_written && desc.is_formatted) {
-                texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size);
+            const auto vsharp = desc.GetSharp(stage);
+            if (vsharp.base_address == 0 || vsharp.GetSize() == 0) {
+                buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
+            } else {
+                const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
+                if (size != vsharp.GetSize()) {
+                    LOG_ERROR(Render, "Clamped size from {} to {} for stage {:#x}",
+                              vsharp.GetSize(), size, stage.pgm_hash);
+                }
+                // Accesses are reported to the runtime with the bound buffers after the draw.
+                const auto [buffer, offset] = buffer_cache.ObtainBuffer(
+                    vsharp.base_address, size, desc.is_written, desc.is_formatted, true);
+                const u64 offset_aligned = Common::AlignDown(offset, alignment);
+                const u64 adjust = offset - offset_aligned;
+                if (adjust % 4 != 0) {
+                    LOG_WARNING(Render_Vulkan, "Buffer binding in shader {:#x} isn't dword aligned",
+                                stage.pgm_hash);
+                }
+                push_data.AddOffset(binding.buffer, adjust);
+                buffer_infos.emplace_back(buffer->Handle(), offset_aligned, size + adjust);
+                bound_buffers.emplace_back(buffer, offset, size, desc.is_written);
+                if (desc.is_written) {
+                    // Raw storage-buffer writes can also make an aliased cached image stale.
+                    texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size);
+                }
+                needs_barrier |= runtime.IsBufferAccessed(buffer, offset, size, desc.is_written);
             }
         }
 
@@ -744,31 +927,36 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
         set_write.dstBinding = binding.unified++;
         set_write.dstArrayElement = 0;
         set_write.descriptorCount = 1;
-        set_write.descriptorType =
-            is_storage ? vk::DescriptorType::eStorageBuffer : vk::DescriptorType::eUniformBuffer;
+        set_write.descriptorType = vk::DescriptorType::eStorageBuffer;
         set_write.pBufferInfo = &buffer_infos.back();
         ++binding.buffer;
     }
 }
 
 void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
-    image_bindings.clear();
     const u32 first_image_idx = image_infos.size();
-    // For loading/storing to explicit mip levels, when no native instruction support, bind an array
-    // of descriptors consecutively, 1 for each mip level. The shader can index this with LOD
-    // operand.
-    // This array holds the size of each consecutive array with the number of bindings consumed.
-    // This is currently always 1 for anything other than mip fallback arrays.
+    // To emulate storing to explicit mip levels, build a descriptor array with each mip level.
     boost::container::small_vector<u32, 8> image_descriptor_array_sizes;
 
+    u32 num_images{};
     for (const auto& image_desc : stage.images) {
         const auto tsharp = image_desc.GetSharp(stage);
-        if (texture_cache.IsMeta(tsharp.Address())) {
-            LOG_WARNING(Render_Vulkan, "Unexpected metadata read by a shader (texture)");
+        const auto data_fmt = tsharp.GetDataFmt();
+        const auto num_fmt = tsharp.GetNumberFmt();
+        if (tsharp.Address() == 0 || data_fmt == AmdGpu::DataFormat::FormatInvalid) {
+            image_bindings[num_images++].image_id = {};
+            image_descriptor_array_sizes.push_back(1);
+            continue;
         }
 
-        if (tsharp.Address() == 0 || tsharp.GetDataFmt() == AmdGpu::DataFormat::FormatInvalid) {
-            image_bindings.emplace_back(std::piecewise_construct, std::tuple{}, std::tuple{});
+        if (!memory->IsValidGpuMapping(tsharp.Address(), 0) ||
+            !magic_enum::enum_contains(data_fmt) || !magic_enum::enum_contains(num_fmt)) {
+            LOG_WARNING(Render_Vulkan,
+                        "Rejecting invalid T# address={:#x}, pitch={}, width={}, "
+                        "data_format={}, num_format={}",
+                        tsharp.Address(), tsharp.pitch, tsharp.width, static_cast<u32>(data_fmt),
+                        static_cast<u32>(num_fmt));
+            image_bindings[num_images++].image_id = {};
             image_descriptor_array_sizes.push_back(1);
             continue;
         }
@@ -777,23 +965,28 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         const u32 num_bindings = image_desc.NumBindings(stage);
 
         for (auto i = 0; i < num_bindings; i++) {
-            auto& [image_id, desc] = image_bindings.emplace_back(
-                std::piecewise_construct, std::tuple{}, std::tuple{tsharp, image_desc});
-
-            if (mip_fallback_mode == Shader::MipStorageFallbackMode::ConstantIndex) {
-                ASSERT(num_bindings == 1);
-                desc.view_info.range.base.level += image_desc.constant_mip_index;
-                desc.view_info.range.extent.levels = 1;
-            } else if (mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex) {
-                desc.view_info.range.base.level += i;
-                desc.view_info.range.extent.levels = 1;
-            }
-
-            image_id = texture_cache.FindImage(desc);
-            if (!ShouldDisableSync()) {
-                rt_sync_.CopyFromLastRt(desc.info.guest_address, image_id, desc.info.size.width,
-                                        desc.info.size.height);
-            }
+            auto& [image_id, desc] = image_bindings[num_images++];
+            // Everything the descriptor is built from.
+            const u32 flags = u32{image_desc.is_written} | u32{image_desc.is_depth} << 1 |
+                              u32{image_desc.is_array} << 2 |
+                              static_cast<u32>(mip_fallback_mode) << 3;
+            const u32 level = mip_fallback_mode == Shader::MipStorageFallbackMode::ConstantIndex
+                                  ? u32{image_desc.constant_mip_index}
+                                  : static_cast<u32>(i);
+            const auto key = MakeKey(VideoCore::TextureCache::BindingType::Texture, flags,
+                                     std::bit_cast<std::array<u32, sizeof(tsharp) / 4>>(tsharp),
+                                     std::array<u32, 1>{level});
+            image_id = texture_cache.FindImageCached(key, desc, [&](auto& new_desc) {
+                std::construct_at(&new_desc, tsharp, image_desc);
+                if (mip_fallback_mode == Shader::MipStorageFallbackMode::ConstantIndex) {
+                    ASSERT(num_bindings == 1);
+                    new_desc.view_info.range.base.level += image_desc.constant_mip_index;
+                    new_desc.view_info.range.extent.levels = 1;
+                } else if (mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex) {
+                    new_desc.view_info.range.base.level += i;
+                    new_desc.view_info.range.extent.levels = 1;
+                }
+            });
             auto* image = &texture_cache.GetImage(image_id);
             if (auto depth_image_id = texture_cache.GetAssociatedDepth(*image)) {
                 // If this image has an associated depth image, it's a stencil attachment.
@@ -813,7 +1006,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     }
 
     // Second pass to re-bind images that were updated after binding
-    for (auto& [image_id, desc] : image_bindings) {
+    for (u32 i = 0; i < num_images; ++i) {
+        auto& [image_id, desc] = image_bindings[i];
         bool is_storage = desc.type == VideoCore::TextureCache::BindingType::Storage;
         if (!image_id) {
             image_infos.emplace_back(VK_NULL_HANDLE, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
@@ -828,45 +1022,39 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
             auto& image = texture_cache.GetImage(image_id);
             auto& image_view = texture_cache.FindTexture(image_id, desc);
+            const auto binding = image.binding;
 
             // The image is either bound as storage in a separate descriptor or bound as render
             // target in feedback loop. Depth images are excluded because they can't be bound as
             // storage and feedback loop doesn't make sense for them
-            if ((image.binding.force_general || image.binding.is_target) &&
-                !image.info.props.is_depth) {
-                image.Transit(instance.IsAttachmentFeedbackLoopLayoutSupported() &&
-                                      image.binding.is_target
-                                  ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
-                                  : vk::ImageLayout::eGeneral,
-                              vk::AccessFlagBits2::eShaderRead |
-                                  (image.info.props.is_depth
-                                       ? vk::AccessFlagBits2::eDepthStencilAttachmentWrite
-                                       : vk::AccessFlagBits2::eColorAttachmentWrite |
-                                             vk::AccessFlagBits2::eColorAttachmentRead),
-                              {});
+            if ((binding.force_general || binding.is_target) && !image.info.props.is_depth) {
+                if (instance.IsAttachmentFeedbackLoopLayoutSupported() && image.binding.is_target) {
+                    needs_barrier |= runtime.Transit(
+                        &image, vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT,
+                        vk::PipelineStageFlagBits2::eAllGraphics, vk::AccessFlagBits2::eShaderRead);
+                } else {
+                    needs_barrier |= runtime.Transit(
+                        &image, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eAllCommands,
+                        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
+                        desc.view_info.range);
+                }
             } else {
                 if (is_storage) {
-                    image.Transit(vk::ImageLayout::eGeneral,
-                                  vk::AccessFlagBits2::eShaderRead |
-                                      vk::AccessFlagBits2::eShaderWrite,
-                                  desc.view_info.range);
+                    needs_barrier |= runtime.Transit(
+                        &image, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eAllCommands,
+                        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
+                        desc.view_info.range);
                 } else {
                     const auto new_layout = image.info.props.is_depth
                                                 ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
                                                 : vk::ImageLayout::eShaderReadOnlyOptimal;
-                    image.Transit(new_layout, vk::AccessFlagBits2::eShaderRead,
-                                  desc.view_info.range);
+                    needs_barrier |= runtime.Transit(
+                        &image, new_layout, vk::PipelineStageFlagBits2::eAllCommands,
+                        vk::AccessFlagBits2::eShaderRead, desc.view_info.range);
                 }
             }
             image.usage.storage |= is_storage;
             image.usage.texture |= !is_storage;
-
-            if (is_storage) {
-                if (std::find(pending_storage_image_ids_.begin(), pending_storage_image_ids_.end(),
-                              image_id) == pending_storage_image_ids_.end()) {
-                    pending_storage_image_ids_.push_back(image_id);
-                }
-            }
 
             image_infos.emplace_back(VK_NULL_HANDLE, *image_view.image_view,
                                      image.backing->state.layout);
@@ -894,13 +1082,20 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
     for (const auto& sampler : stage.samplers) {
         auto ssharp = sampler.GetSharp(stage);
-        if (sampler.disable_aniso) {
-            const auto& tsharp = stage.images[sampler.associated_image].GetSharp(stage);
-            if (tsharp.base_level == 0 && tsharp.last_level == 0) {
-                ssharp.max_aniso.Assign(AmdGpu::AnisoRatio::One);
-            }
+        if (!ssharp.Valid() || (ssharp.border_color_type.Value() == AmdGpu::BorderColor::Custom &&
+                                liverpool->regs.ta_bc_base.Address() == 0)) {
+            LOG_WARNING(Render_Vulkan,
+                        "Rejecting invalid S# max_aniso={}, filter_mode={}, mip_filter={}, "
+                        "border_color_type={}, border_color_base={:#x}",
+                        static_cast<u32>(ssharp.max_aniso.Value()),
+                        static_cast<u32>(ssharp.filter_mode.Value()),
+                        static_cast<u32>(ssharp.mip_filter.Value()),
+                        static_cast<u32>(ssharp.border_color_type.Value()),
+                        liverpool->regs.ta_bc_base.Address());
+            ssharp = AmdGpu::Sampler{};
         }
-        const auto vk_sampler = texture_cache.GetSampler(ssharp, liverpool->regs.ta_bc_base);
+        const auto vk_sampler =
+            texture_cache.GetSampler(ssharp, liverpool->regs.ta_bc_base, sampler.is_depth);
         image_infos.emplace_back(vk_sampler, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
         auto& set_write = set_writes[set_write_index++];
         set_write.dstSet = VK_NULL_HANDLE;
@@ -913,7 +1108,6 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 }
 
 RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
-
     attachment_feedback_loop = false;
     const auto& regs = liverpool->regs;
     const auto& key = pipeline->GetGraphicsKey();
@@ -928,50 +1122,46 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
             state.color_attachments[cb] = {};
             continue;
         }
-
         auto* image = &texture_cache.GetImage(image_id);
         if (image->binding.needs_rebind) {
             image_id = bound_images.emplace_back(texture_cache.FindImage(desc));
             image = &texture_cache.GetImage(image_id);
         }
-
         texture_cache.UpdateImage(image_id);
-        image->SetBackingSamples(key.color_samples[cb]);
+        runtime.SetBackingSamples(image, key.color_samples[cb]);
         const auto& image_view = texture_cache.FindRenderTarget(image_id, desc);
-        const auto& serial = Common::ElfInfo::Instance().GameSerial();
-        if (!ShouldDisableSync() && serial != "CUSA11227" && serial != "CUSA12982" &&
-            serial != "CUSA00093" && serial != "CUSA00003" && serial != "CUSA01778" &&
-            serial != "CUSA01627") {
-            rt_sync_.RecordRtWrite(desc.info.guest_address, image_id);
-            // 1×1 render target: force download to guest so CPU can read the result
-            if (desc.info.size.width == 1 && desc.info.size.height == 1) {
-                rt_sync_.Schedule1x1Readback(image_id);
-            }
-        }
-
         const auto slice = image_view.info.range.base.layer;
         const auto mip = image_view.info.range.base.level;
+
         const auto& col_buf = regs.color_buffers[cb];
         const bool is_clear = texture_cache.IsMetaCleared(col_buf.CmaskAddress(), slice);
         texture_cache.TouchMeta(col_buf.CmaskAddress(), slice, false);
+
         if (image->binding.is_bound) {
             ASSERT_MSG(!image->binding.force_general,
                        "Having image both as storage and render target is unsupported");
-            image->Transit(instance.IsAttachmentFeedbackLoopLayoutSupported()
-                               ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
-                               : vk::ImageLayout::eGeneral,
-                           vk::AccessFlagBits2::eColorAttachmentWrite, {});
+            runtime.FlushBarriers();
+            needs_barrier |=
+                runtime.Transit(image,
+                                instance.IsAttachmentFeedbackLoopLayoutSupported()
+                                    ? vk::ImageLayout::eAttachmentFeedbackLoopOptimalEXT
+                                    : vk::ImageLayout::eGeneral,
+                                vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                                vk::AccessFlagBits2::eColorAttachmentWrite |
+                                    vk::AccessFlagBits2::eColorAttachmentRead);
             attachment_feedback_loop = true;
         } else {
-            image->Transit(vk::ImageLayout::eColorAttachmentOptimal,
-                           vk::AccessFlagBits2::eColorAttachmentWrite |
-                               vk::AccessFlagBits2::eColorAttachmentRead,
-                           desc.view_info.range);
+            needs_barrier |= runtime.Transit(image, vk::ImageLayout::eColorAttachmentOptimal,
+                                             vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                                             vk::AccessFlagBits2::eColorAttachmentWrite |
+                                                 vk::AccessFlagBits2::eColorAttachmentRead,
+                                             desc.view_info.range);
         }
 
         state.width = std::min<u32>(state.width, std::max(image->info.size.width >> mip, 1u));
         state.height = std::min<u32>(state.height, std::max(image->info.size.height >> mip, 1u));
         state.num_layers = std::min<u32>(state.num_layers, image_view.info.range.extent.layers);
+
         const auto clear_value =
             is_clear ? LiverpoolToVK::ColorBufferClearValue(col_buf) : vk::ClearValue{};
         auto& attachment = state.color_attachments[cb];
@@ -979,9 +1169,9 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         attachment.image_layout = image->backing->state.layout;
         attachment.clear_value = clear_value.color.uint32;
         attachment.is_clear = is_clear;
+
         image->usage.render_target = 1u;
     }
-
     for (u32 cb = state.num_color_attachments; cb < state.color_attachments.size(); ++cb) {
         state.color_attachments[cb] = {};
     }
@@ -991,16 +1181,16 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         const auto htile_address = regs.depth_htile_data_base.GetAddress();
         const auto& image_view = texture_cache.FindDepthTarget(image_id, desc);
         auto& image = texture_cache.GetImage(image_id);
+
         const auto slice = image_view.info.range.base.layer;
-        // Only clear depth if writes are enabled —PS4 hardware ignores clear when
-        // depth_write_enable is false, otherwise data from a previous pass is lost.
         const bool is_depth_clear =
-            (ShouldDisableSync() ? true : regs.depth_control.depth_write_enable) &&
-            (regs.depth_render_control.depth_clear_enable ||
-             texture_cache.IsMetaCleared(htile_address, slice));
+            (regs.depth_render_control.depth_clear_enable && regs.depth_control.depth_enable &&
+             regs.depth_control.depth_write_enable) ||
+            texture_cache.IsMetaCleared(htile_address, slice);
         const bool is_stencil_clear = regs.depth_render_control.stencil_clear_enable;
         texture_cache.TouchMeta(htile_address, slice, false);
         ASSERT(desc.view_info.range.extent.levels == 1 && !image.binding.needs_rebind);
+
         const bool has_stencil = image.info.props.has_stencil;
         // Stencil writes can be enabled while depth writes are off.
         const bool stencil_write =
@@ -1012,36 +1202,43 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
                                     ? vk::ImageLayout::eDepthReadOnlyStencilAttachmentOptimal
                                 : has_stencil ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
                                               : vk::ImageLayout::eDepthReadOnlyOptimal;
-        image.Transit(new_layout,
-                      vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
-                          vk::AccessFlagBits2::eDepthStencilAttachmentRead,
-                      desc.view_info.range);
+        needs_barrier |= runtime.Transit(&image, new_layout,
+                                         vk::PipelineStageFlagBits2::eEarlyFragmentTests |
+                                             vk::PipelineStageFlagBits2::eLateFragmentTests,
+                                         vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
+                                             vk::AccessFlagBits2::eDepthStencilAttachmentRead,
+                                         desc.view_info.range);
+
         state.width = std::min<u32>(state.width, image.info.size.width);
         state.height = std::min<u32>(state.height, image.info.size.height);
         state.num_layers = std::min<u32>(state.num_layers, image_view.info.range.extent.layers);
+
         auto& attachment = state.depth_stencil_attachment;
         attachment.image_view = *image_view.image_view;
         attachment.image_layout = image.backing->state.layout;
         attachment.clear_value = {};
+        attachment.is_clear = 0;
 
         if (regs.depth_buffer.DepthValid()) {
             attachment.clear_value[0] = is_depth_clear ? std::bit_cast<u32>(regs.depth_clear) : 0u;
             attachment.has_depth = true;
             attachment.depth_clear = is_depth_clear;
         }
-
         if (regs.depth_buffer.StencilValid()) {
             attachment.clear_value[1] = is_stencil_clear ? regs.stencil_clear : 0u;
             attachment.has_stencil = true;
             attachment.stencil_clear = is_stencil_clear;
         }
+
         image.usage.depth_target = true;
     } else {
         state.depth_stencil_attachment = {};
     }
+
     if (state.num_layers == std::numeric_limits<u16>::max()) {
         state.num_layers = 1;
     }
+
     return state;
 }
 
@@ -1056,7 +1253,8 @@ void Rasterizer::Resolve() {
     ScopeMarkerBegin(fmt::format("Resolve:MRT0={:#x}:MRT1={:#x}",
                                  liverpool->regs.color_buffers[0].Address(),
                                  liverpool->regs.color_buffers[1].Address()));
-    mrt1_image.Resolve(mrt0_image, mrt0_desc.view_info.range, mrt1_desc.view_info.range);
+    runtime.ResolveImage(&mrt0_image, &mrt1_image, mrt0_desc.view_info.range,
+                         mrt1_desc.view_info.range);
     ScopeMarkerEnd();
 }
 
@@ -1082,51 +1280,60 @@ void Rasterizer::DepthStencilCopy(bool is_depth, bool is_stencil) {
         regs.depth_buffer.StencilAddress(), regs.depth_buffer.DepthWriteAddress(),
         regs.depth_buffer.StencilWriteAddress()));
 
-    read_image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
-                       sub_range);
-    write_image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
-                        sub_range);
-
-    auto aspect_mask = vk::ImageAspectFlags(0);
-    if (is_depth) {
-        aspect_mask |= vk::ImageAspectFlagBits::eDepth;
-    }
-    if (is_stencil) {
-        aspect_mask |= vk::ImageAspectFlagBits::eStencil;
-    }
-
-    vk::ImageCopy region = {
-        .srcSubresource =
-            {
-                .aspectMask = aspect_mask,
-                .mipLevel = 0,
-                .baseArrayLayer = sub_range.base.layer,
-                .layerCount = sub_range.extent.layers,
-            },
-        .srcOffset = {0, 0, 0},
-        .dstSubresource =
-            {
-                .aspectMask = aspect_mask,
-                .mipLevel = 0,
-                .baseArrayLayer = sub_range.base.layer,
-                .layerCount = sub_range.extent.layers,
-            },
-        .dstOffset = {0, 0, 0},
-        .extent = {write_image.info.size.width, write_image.info.size.height, 1},
-    };
-    scheduler.CommandBuffer().copyImage(read_image.GetImage(), vk::ImageLayout::eTransferSrcOptimal,
-                                        write_image.GetImage(),
-                                        vk::ImageLayout::eTransferDstOptimal, region);
+    runtime.CopyDepthStencil(&read_image, &write_image, sub_range);
 
     ScopeMarkerEnd();
 }
 
 void Rasterizer::FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds) {
-    buffer_cache.FillBuffer(address, num_bytes, value, is_gds);
+    ASSERT_MSG(address % 4 == 0 && num_bytes % 4 == 0,
+               "FillBuffer address and size must be a multiple of 4 bytes");
+    if (!is_gds) {
+        texture_cache.ClearMeta(address);
+        if (!buffer_cache.IsRegionGpuModified(address, num_bytes)) {
+            u32* buffer = std::bit_cast<u32*>(address);
+            std::fill(buffer, buffer + (num_bytes / sizeof(u32)), value);
+            return;
+        }
+    }
+    const auto [buffer, offset] = [&] -> std::pair<const VideoCore::Buffer*, u64> {
+        if (is_gds) {
+            return {buffer_cache.GetGdsBuffer(), address};
+        }
+        return buffer_cache.ObtainBuffer(address, num_bytes, true);
+    }();
+    runtime.FillBuffer(buffer, offset, num_bytes, value);
 }
 
 void Rasterizer::CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds) {
-    buffer_cache.CopyBuffer(dst, src, num_bytes, dst_gds, src_gds);
+    if (!dst_gds && !buffer_cache.IsRegionGpuModified(dst, num_bytes)) {
+        if (!src_gds && !buffer_cache.IsRegionGpuModified(src, num_bytes) &&
+            !texture_cache.FindImageFromRange(src, num_bytes)) {
+            // Both buffers were not transferred to GPU yet. Can safely copy in host memory.
+            std::memcpy(std::bit_cast<void*>(dst), std::bit_cast<void*>(src), num_bytes);
+            return;
+        }
+    }
+    texture_cache.InvalidateMemoryFromGPU(dst, num_bytes);
+    const auto* gds_buffer = buffer_cache.GetGdsBuffer();
+    const auto [src_buffer, src_offset] = [&] -> std::pair<const VideoCore::Buffer*, u64> {
+        if (src_gds) {
+            return {gds_buffer, src};
+        }
+        return buffer_cache.ObtainBuffer(src, num_bytes, false, true);
+    }();
+    const auto [dst_buffer, dst_offset] = [&] -> std::pair<const VideoCore::Buffer*, u64> {
+        if (dst_gds) {
+            return {gds_buffer, dst};
+        }
+        return buffer_cache.ObtainBuffer(dst, num_bytes, true, true);
+    }();
+    const vk::BufferCopy copy = {
+        .srcOffset = src_offset,
+        .dstOffset = dst_offset,
+        .size = num_bytes,
+    };
+    runtime.CopyBuffer(src_buffer, dst_buffer, std::span{&copy, 1});
 }
 
 u32 Rasterizer::ReadDataFromGds(u32 gds_offset) {
@@ -1136,27 +1343,36 @@ u32 Rasterizer::ReadDataFromGds(u32 gds_offset) {
     return value;
 }
 
-bool Rasterizer::InvalidateMemory(VAddr addr, u64 size) {
+bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks) {
     if (!IsMapped(addr, size)) {
         // Not GPU mapped memory, can skip invalidation logic entirely.
         return false;
     }
-    buffer_cache.InvalidateMemory(addr, size, true);
+    buffer_cache.InvalidateMemory(addr, size, assume_locks);
     texture_cache.InvalidateMemory(addr, size);
     return true;
 }
 
-bool Rasterizer::ReadMemory(VAddr addr, u64 size) {
+void Rasterizer::InvalidateBuffersAhead(VAddr addr, u64 size) {
+    // Memory the GPU modified would have to be read back first, which costs more than the faults
+    // this saves. Images watch their pages separately, so writes to them still fault.
+    if (!IsMapped(addr, size) || buffer_cache.IsRegionGpuModified(addr, size)) {
+        return;
+    }
+    buffer_cache.InvalidateMemory(addr, size);
+}
+
+bool Rasterizer::ReadMemory(VAddr addr, u64 size, bool assume_locks) {
     if (!IsMapped(addr, size)) {
         // Not GPU mapped memory, can skip invalidation logic entirely.
         return false;
     }
-    buffer_cache.ReadMemory(addr, size);
+    buffer_cache.ReadMemory(addr, size, false, assume_locks);
     return true;
 }
 
-void Rasterizer::ProcessDownloadImages() {
-    texture_cache.ProcessDownloadImages();
+void Rasterizer::OnBackingWritten(VAddr addr, u64 size) {
+    buffer_cache.OnBackingWritten(addr, size);
 }
 
 bool Rasterizer::IsMapped(VAddr addr, u64 size) {
@@ -1179,13 +1395,15 @@ void Rasterizer::MapMemory(VAddr addr, u64 size) {
         std::scoped_lock lock{mapped_ranges_mutex};
         mapped_ranges += decltype(mapped_ranges)::interval_type::right_open(addr, addr + size);
     }
+}
+
+void Rasterizer::RegisterMemory(VAddr addr, u64 size) {
     page_manager.OnGpuMap(addr, size);
 }
 
 void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
-    buffer_cache.InvalidateMemory(addr, size, true);
+    buffer_cache.InvalidateMemory(addr, size);
     texture_cache.UnmapMemory(addr, size);
-    page_manager.OnGpuUnmap(addr, size);
     {
         std::scoped_lock lock{mapped_ranges_mutex};
         mapped_ranges -= decltype(mapped_ranges)::interval_type::right_open(addr, addr + size);
@@ -1193,11 +1411,23 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
 }
 
 void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool is_indexed) const {
-    UpdateViewportScissorState();
-    UpdateDepthStencilState();
-    UpdatePrimitiveState(is_indexed);
-    UpdateRasterizationState();
-    UpdateColorBlendingState(pipeline);
+    // Draws mostly come with the state the draw before them set, and building it again from the
+    // registers for each was a part of every draw. The dynamic state keeps what it was set to,
+    // and sets it again in a new command buffer.
+    const DynamicStateInputs inputs{
+        .regs_version = liverpool->context_regs_version,
+        .write_masks = pipeline->GetGraphicsKey().write_masks,
+        .feedback_loop = attachment_feedback_loop,
+        .is_indexed = is_indexed,
+    };
+    if (inputs != last_dynamic_inputs) {
+        UpdateViewportScissorState();
+        UpdateDepthStencilState();
+        UpdatePrimitiveState(is_indexed);
+        UpdateRasterizationState();
+        UpdateColorBlendingState(pipeline);
+        last_dynamic_inputs = inputs;
+    }
 
     auto& dynamic_state = scheduler.GetDynamicState();
     dynamic_state.Commit(instance, scheduler.CommandBuffer());
@@ -1334,20 +1564,114 @@ void Rasterizer::UpdateViewportScissorState() const {
     dynamic_state.SetScissors(scissors);
 }
 
+struct StencilFaceState {
+    vk::StencilOp fail_op;
+    vk::StencilOp pass_op;
+    vk::StencilOp depth_fail_op;
+    u32 reference;
+};
+
+// GCN has separate stencil test (STENCILTESTVAL) and replace (STENCILOPVAL) values, while a Vulkan
+// face has a single reference for both. Finds a reference that keeps the test exact and still
+// writes what every replacing op should, turning such ops into equivalent ones (zero, keep,
+// invert, increment, decrement) where the stencil value is known. Returns nullopt if it can't.
+static std::optional<StencilFaceState> ResolveStencilFace(AmdGpu::CompareFunc func,
+                                                          const AmdGpu::StencilRefMask& ref,
+                                                          u32 write_mask, AmdGpu::StencilFunc fail,
+                                                          AmdGpu::StencilFunc zpass,
+                                                          AmdGpu::StencilFunc zfail) {
+    using AmdGpu::CompareFunc;
+    using AmdGpu::StencilFunc;
+    const u32 test_val = ref.stencil_test_val;
+    const u32 compare_mask = ref.stencil_mask;
+    write_mask &= 0xFF;
+    const bool test_uses_reference = func != CompareFunc::Always && func != CompareFunc::Never;
+
+    const auto written_value = [&](StencilFunc op) -> std::optional<u32> {
+        switch (op) {
+        case StencilFunc::ReplaceTest:
+            return test_val;
+        case StencilFunc::ReplaceOp:
+            return ref.stencil_op_val;
+        case StencilFunc::Ones:
+            return 0xFFU;
+        default:
+            return std::nullopt;
+        }
+    };
+
+    // An EQUAL test that passed, or a NOTEQUAL test that failed, means the stencil value matches
+    // test_val in the compared bits, which is enough to know what a write will change.
+    const bool written_bits_compared = (write_mask & ~compare_mask) == 0;
+    const bool whole_value_known = compare_mask == 0xFF && write_mask == 0xFF;
+    const bool known_on_pass = func == CompareFunc::Equal && written_bits_compared;
+    const bool known_on_fail = func == CompareFunc::NotEqual && written_bits_compared;
+
+    const auto resolve = [&](StencilFunc op, u32 reference,
+                             bool value_known) -> std::optional<vk::StencilOp> {
+        const auto value = written_value(op);
+        if (!value) {
+            return LiverpoolToVK::StencilOp(op);
+        }
+        const u32 target = *value & write_mask;
+        if (target == (reference & write_mask)) {
+            return vk::StencilOp::eReplace;
+        }
+        if (target == 0) {
+            return vk::StencilOp::eZero;
+        }
+        if (value_known) {
+            if (target == (test_val & write_mask)) {
+                return vk::StencilOp::eKeep;
+            }
+            if (target == (~test_val & write_mask)) {
+                return vk::StencilOp::eInvert;
+            }
+            if (whole_value_known && *value == ((test_val + 1) & 0xFF)) {
+                return vk::StencilOp::eIncrementAndWrap;
+            }
+            if (whole_value_known && *value == ((test_val - 1) & 0xFF)) {
+                return vk::StencilOp::eDecrementAndWrap;
+            }
+        }
+        return std::nullopt;
+    };
+
+    // Try each written value as the reference. When the test reads the reference, its compared
+    // bits must stay those of test_val, and only the rest can carry the written value.
+    const std::array<std::optional<u32>, 4> candidates = {
+        written_value(zpass), written_value(zfail), written_value(fail), test_val};
+    for (const auto& candidate : candidates) {
+        if (!candidate) {
+            continue;
+        }
+        const u32 reference = test_uses_reference
+                                  ? (test_val & compare_mask) | (*candidate & ~compare_mask & 0xFF)
+                                  : *candidate;
+        const auto fail_op = resolve(fail, reference, known_on_fail);
+        const auto pass_op = resolve(zpass, reference, known_on_pass);
+        const auto depth_fail_op = resolve(zfail, reference, known_on_pass);
+        if (fail_op && pass_op && depth_fail_op) {
+            return StencilFaceState{*fail_op, *pass_op, *depth_fail_op, reference};
+        }
+    }
+    return std::nullopt;
+}
+
 void Rasterizer::UpdateDepthStencilState() const {
     const auto& regs = liverpool->regs;
     auto& dynamic_state = scheduler.GetDynamicState();
 
-    const auto depth_stencil = GetEffectiveDepthStencilState(regs);
-    const bool depth_test_enabled = depth_stencil.depth_test_enable;
+    const auto depth_test_enabled =
+        regs.depth_control.depth_enable && regs.depth_buffer.DepthValid();
     dynamic_state.SetDepthTestEnabled(depth_test_enabled);
-    dynamic_state.SetDepthWriteEnabled(depth_stencil.depth_write_enable &&
-                                       !regs.depth_render_control.depth_clear_enable);
     if (depth_test_enabled) {
+        dynamic_state.SetDepthWriteEnabled(regs.depth_control.depth_write_enable &&
+                                           !regs.depth_render_control.depth_clear_enable);
         dynamic_state.SetDepthCompareOp(LiverpoolToVK::CompareOp(regs.depth_control.depth_func));
     }
 
-    const bool depth_bounds_test_enabled = depth_stencil.depth_bounds_enable;
+    const auto depth_bounds_test_enabled = regs.depth_control.depth_bounds_enable;
     dynamic_state.SetDepthBoundsTestEnabled(depth_bounds_test_enabled);
     if (depth_bounds_test_enabled) {
         dynamic_state.SetDepthBounds(regs.depth_bounds_min, regs.depth_bounds_max);
@@ -1363,30 +1687,63 @@ void Rasterizer::UpdateDepthStencilState() const {
             (front ? regs.poly_offset.front_scale : regs.poly_offset.back_scale) / 16.f);
     }
 
-    const bool stencil_test_enabled = depth_stencil.stencil_test_enable;
+    const auto stencil_test_enabled =
+        regs.depth_control.stencil_enable && regs.depth_buffer.StencilValid();
     dynamic_state.SetStencilTestEnabled(stencil_test_enabled);
     if (stencil_test_enabled) {
-        const StencilOps front_ops{
-            .fail_op = LiverpoolToVK::StencilOp(regs.stencil_control.stencil_fail_front),
-            .pass_op = LiverpoolToVK::StencilOp(regs.stencil_control.stencil_zpass_front),
-            .depth_fail_op = LiverpoolToVK::StencilOp(regs.stencil_control.stencil_zfail_front),
-            .compare_op = LiverpoolToVK::CompareOp(regs.depth_control.stencil_ref_func),
-        };
-        const StencilOps back_ops = regs.depth_control.backface_enable ? StencilOps{
-            .fail_op = LiverpoolToVK::StencilOp(regs.stencil_control.stencil_fail_back),
-            .pass_op = LiverpoolToVK::StencilOp(regs.stencil_control.stencil_zpass_back),
-            .depth_fail_op = LiverpoolToVK::StencilOp(regs.stencil_control.stencil_zfail_back),
-            .compare_op = LiverpoolToVK::CompareOp(regs.depth_control.stencil_bf_func),
-        } : front_ops;
-        dynamic_state.SetStencilOps(front_ops, back_ops);
-
         const bool stencil_clear = regs.depth_render_control.stencil_clear_enable;
         const auto front = regs.stencil_ref_front;
         const auto back =
             regs.depth_control.backface_enable ? regs.stencil_ref_back : regs.stencil_ref_front;
-        dynamic_state.SetStencilReferences(front.stencil_test_val, back.stencil_test_val);
-        dynamic_state.SetStencilWriteMasks(!stencil_clear ? front.stencil_write_mask : 0U,
-                                           !stencil_clear ? back.stencil_write_mask : 0U);
+        const u32 front_write_mask = !stencil_clear ? front.stencil_write_mask : 0U;
+        const u32 back_write_mask = !stencil_clear ? back.stencil_write_mask : 0U;
+
+        const auto setup_face = [](AmdGpu::CompareFunc func, const AmdGpu::StencilRefMask& ref,
+                                   u32 write_mask, AmdGpu::StencilFunc fail,
+                                   AmdGpu::StencilFunc zpass,
+                                   AmdGpu::StencilFunc zfail) -> std::pair<StencilOps, u32> {
+            if (const auto face = ResolveStencilFace(func, ref, write_mask, fail, zpass, zfail)) {
+                return {StencilOps{
+                            .fail_op = face->fail_op,
+                            .pass_op = face->pass_op,
+                            .depth_fail_op = face->depth_fail_op,
+                            .compare_op = LiverpoolToVK::CompareOp(func),
+                        },
+                        face->reference};
+            }
+            // GCN REPLACE_OP writes DB_STENCILREFMASK.STENCILOPVAL, so when both values can't be
+            // honored a face whose stencil ops include ReplaceOp takes its reference from op_val.
+            const bool uses_op_val = fail == AmdGpu::StencilFunc::ReplaceOp ||
+                                     zpass == AmdGpu::StencilFunc::ReplaceOp ||
+                                     zfail == AmdGpu::StencilFunc::ReplaceOp;
+            const u32 reference = uses_op_val ? ref.stencil_op_val : ref.stencil_test_val;
+            LOG_WARNING(Render_Vulkan,
+                        "Stencil func {} test_val {:#x} mask {:#x} can't be combined with ops "
+                        "{}/{}/{} op_val {:#x} write mask {:#x}; using reference {:#x}",
+                        static_cast<u32>(func), ref.stencil_test_val, ref.stencil_mask,
+                        static_cast<u32>(fail), static_cast<u32>(zpass), static_cast<u32>(zfail),
+                        ref.stencil_op_val, write_mask, reference);
+            return {StencilOps{
+                        .fail_op = LiverpoolToVK::StencilOp(fail),
+                        .pass_op = LiverpoolToVK::StencilOp(zpass),
+                        .depth_fail_op = LiverpoolToVK::StencilOp(zfail),
+                        .compare_op = LiverpoolToVK::CompareOp(func),
+                    },
+                    reference};
+        };
+
+        const auto& sc = regs.stencil_control;
+        const auto [front_ops, front_reference] =
+            setup_face(regs.depth_control.stencil_ref_func, front, front_write_mask,
+                       sc.stencil_fail_front, sc.stencil_zpass_front, sc.stencil_zfail_front);
+        const auto [back_ops, back_reference] =
+            regs.depth_control.backface_enable
+                ? setup_face(regs.depth_control.stencil_bf_func, back, back_write_mask,
+                             sc.stencil_fail_back, sc.stencil_zpass_back, sc.stencil_zfail_back)
+                : std::pair{front_ops, front_reference};
+        dynamic_state.SetStencilOps(front_ops, back_ops);
+        dynamic_state.SetStencilReferences(front_reference, back_reference);
+        dynamic_state.SetStencilWriteMasks(front_write_mask, back_write_mask);
         dynamic_state.SetStencilCompareMasks(front.stencil_mask, back.stencil_mask);
     }
 }
@@ -1443,8 +1800,8 @@ void Rasterizer::UpdateColorBlendingState(const GraphicsPipeline* pipeline) cons
 }
 
 void Rasterizer::ScopeMarkerBegin(const std::string_view& str, bool from_guest) {
-    if ((from_guest && !Config::getVkGuestMarkersEnabled()) ||
-        (!from_guest && !Config::getVkHostMarkersEnabled())) {
+    if ((from_guest && !EmulatorSettings.IsVkGuestMarkersEnabled()) ||
+        (!from_guest && !EmulatorSettings.IsVkHostMarkersEnabled())) {
         return;
     }
     const auto cmdbuf = scheduler.CommandBuffer();
@@ -1454,8 +1811,8 @@ void Rasterizer::ScopeMarkerBegin(const std::string_view& str, bool from_guest) 
 }
 
 void Rasterizer::ScopeMarkerEnd(bool from_guest) {
-    if ((from_guest && !Config::getVkGuestMarkersEnabled()) ||
-        (!from_guest && !Config::getVkHostMarkersEnabled())) {
+    if ((from_guest && !EmulatorSettings.IsVkGuestMarkersEnabled()) ||
+        (!from_guest && !EmulatorSettings.IsVkHostMarkersEnabled())) {
         return;
     }
     const auto cmdbuf = scheduler.CommandBuffer();
@@ -1463,8 +1820,8 @@ void Rasterizer::ScopeMarkerEnd(bool from_guest) {
 }
 
 void Rasterizer::ScopedMarkerInsert(const std::string_view& str, bool from_guest) {
-    if ((from_guest && !Config::getVkGuestMarkersEnabled()) ||
-        (!from_guest && !Config::getVkHostMarkersEnabled())) {
+    if ((from_guest && !EmulatorSettings.IsVkGuestMarkersEnabled()) ||
+        (!from_guest && !EmulatorSettings.IsVkHostMarkersEnabled())) {
         return;
     }
     const auto cmdbuf = scheduler.CommandBuffer();
@@ -1475,8 +1832,8 @@ void Rasterizer::ScopedMarkerInsert(const std::string_view& str, bool from_guest
 
 void Rasterizer::ScopedMarkerInsertColor(const std::string_view& str, const u32 color,
                                          bool from_guest) {
-    if ((from_guest && !Config::getVkGuestMarkersEnabled()) ||
-        (!from_guest && !Config::getVkHostMarkersEnabled())) {
+    if ((from_guest && !EmulatorSettings.IsVkGuestMarkersEnabled()) ||
+        (!from_guest && !EmulatorSettings.IsVkHostMarkersEnabled())) {
         return;
     }
     const auto cmdbuf = scheduler.CommandBuffer();
@@ -1486,5 +1843,15 @@ void Rasterizer::ScopedMarkerInsertColor(const std::string_view& str, const u32 
             {(f32)((color >> 16) & 0xff) / 255.0f, (f32)((color >> 8) & 0xff) / 255.0f,
              (f32)(color & 0xff) / 255.0f, (f32)((color >> 24) & 0xff) / 255.0f})});
 }
+
+std::thread::id Rasterizer::GetGpuCommandProcessorThread() {
+    return liverpool->GetGpuCommandProcessorThread();
+}
+
+#ifdef __linux__
+u32 Rasterizer::GetGpuCommandProcessorThreadId() {
+    return liverpool->GetGpuCommandProcessorThreadId();
+}
+#endif
 
 } // namespace Vulkan

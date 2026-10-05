@@ -1,46 +1,7 @@
 <!--
-SPDX-FileCopyrightText: 2024 shadPS4 Emulator Project
+SPDX-FileCopyrightText: 2026 shadPS4 Emulator Project
 SPDX-License-Identifier: GPL-2.0-or-later
 -->
-Discord server for talking about forks. https://discord.gg/jgpqB7gUxG 
-
-NEW GUI reworked + Cinema mode (netflix style) BigPicture and Gamehub modes if the QT gui is not of your liking
-
-<img width="1625" height="982" alt="image" src="https://github.com/user-attachments/assets/ac0d3837-a8f0-456b-bde8-df8ffb4a5f94" />
-
-<img width="1280" height="755" alt="image" src="https://github.com/user-attachments/assets/ca6749a6-5649-40cf-91ef-23219dcc3331" />
-
-This repository has three branches with extra features based on the main Shad branch. They are experimental or self-added for convenience. They all share the following Bloodborne-specific enhancements:
-
-NOTE:     Shadlix IS THE ONLY ONE THAT I WILL UPDATE FROM NOW ON, ALSO IT WILL HAVE ALL THE FEATURES INTO EXPERIMENTAL TAB. 
-
--A sound hack that prevents Bloodborne from losing audio. (originally made by rainvmaker)
-
--Automatic backups via a checkbox in the Graphics tab in Settings.
-
--A PM4 Type 0 hack to avoid related issues. (Do not use this with the "Copy Buffer" checkbox under the Debug tab in Settings.)
-
--An RCAS bar in Settings to adjust FSR sharpness.
-
--Several Hotkeys
-
--Restart and Stop buttons working.
-
--Keyboard and mouse custom button mapping for FromSoftware games.
-
--An Experimental tab with all new features and both isDevKit and Neo Mode (PS4 Pro Mode) checkboxes in Settings.
-
--Safe Tiling and USB PRs that I developed for main Shad.
-
-![image](https://github.com/user-attachments/assets/65f59145-65ca-4296-bab4-e6c55ec6e5bc)
-
-PRTBB This is the safest branch at the moment. It doesn’t include any extra features.
-
-Shadlix (previously known as BBFork) -Includes a high-resolution hack (thanks to fmod) with adjonesse hack to stabilize it and modified by me to avoid crashing other games. -Note: May impact performance on mid- or low-end systems.
-
-Full-Souls -Includes the AV improvements PR to prevent Dark Souls 2’s main intro from crashing.
-
--Includes a variaty of readbacks speeds adjusted by me, modified from the lastest Readbacks optmization pr from Turtle Developer. Note: This can cause minor stutters in heavy areas when loading first time.
 
 <h1 align="center">
   <br>
@@ -71,9 +32,60 @@ Full-Souls -Includes the AV improvements PR to prevent Dark Souls 2’s main int
 | :------------------------------------------------------------------------: | :------------------------------------------------------------------: |
 | ![Yakuza screenshot](./documents/Screenshots/3.png) | ![DRIVECLUB screenshot](./documents/Screenshots/4.png) |
 
+# inFAMOUS High-FPS Custom Build
+
+This repository and branch is a custom build of shadPS4 focused on providing dedicated fixes to run **inFAMOUS Second Son** and **inFAMOUS First Light** at high framerates, as well as addressing various graphical issues and color corrections.
+
+- **Developers / Geliştiriciler:** Eye Of The Ruins, 0xDeftones
+
+> [!NOTE]
+> Various bugs and glitches may still be present, but the primary focus of this build is to deliver maximum performance.
+
+### Performance Comparison vs Main Branch / Performans Karşılaştırması
+
+**Test System / Test Sistemi:** AMD Ryzen 9 7950X CPU, NVIDIA GeForce RTX 4090 GPU
+
+| Before (Main Branch) | After (Custom Build) |
+| :-------------------: | :------------------: |
+| ![Before (Main Branch)](./ss/before.jpg) | ![After (Custom Build)](./ss/after.jpg) |
+
+### Recommended Settings
+
+- **FSR:** Do **NOT** enable FSR under any circumstances; it causes graphical corruption.
+- **Debug:**
+  - **Readbacks Mode:** Must be set to `Precise`.
+  - **Enable Direct Memory Access:** Must be enabled (ON).
+  - **Enable Shader Cache:** Must be enabled (ON).
+- **Vblank Frequency:** Must be configured according to your desired target framerate.
+
+---
+
+### Özel Sürüm Bilgisi (inFAMOUS Yüksek FPS Build)
+
+Bu repo ve branch, **inFAMOUS Second Son** ve **inFAMOUS First Light** oyunlarını yüksek kare hızında oynamayı sağlayan düzeltmelerin (fixler) yanı sıra çeşitli grafiksel sorunları gideren ve renk düzeltmeleri içeren özel bir derlemedir (custom build).
+
+- **Geliştiriciler:** Eye Of The Ruins, 0xDeftones
+
+> [!NOTE]
+> Çeşitli buglar ve hatalar halen mevcut olabilir, ancak bu derlemenin temel amacı yüksek performans sağlamaktır.
+
+#### Önerilen Ayarlar
+
+- **FSR:** Kesinlikle açılmamalı, grafiksel bozulmalara yol açıyor.
+- **Debug:**
+  - **Readbacks Mode:** Değeri `Precise` olmalı.
+  - **Enable Direct Memory Access:** Açık olmalı.
+  - **Enable Shader Cache:** Açık olmalı.
+- **Vblank Frequency:** İstenilen kare hızına göre ayarlanmış olmalı.
+
+---
+
 # General information
 
 **shadPS4** is an early **PlayStation 4** emulator for **Windows**, **Linux** and **macOS** written in C++.
+
+> [!IMPORTANT]
+> This is the emulator core, which does not include a GUI. If you just want to use the emulator as an end user, download the [**QtLauncher**](https://github.com/shadps4-emu/shadps4-qtlauncher/releases) instead.
 
 If you encounter problems or have doubts, do not hesitate to look at the [**Quickstart**](https://github.com/shadps4-emu/shadPS4/wiki/I.-Quick-start-%5BUsers%5D).\
 To verify that a game works, you can look at [**shadPS4 Game Compatibility**](https://github.com/shadps4-compatibility/shadps4-game-compatibility).\
@@ -99,9 +111,6 @@ This project began for fun. Given our limited free time, it may take some time b
 For building shadPS4 in a containerized environment using Docker and VSCode, check the instructions here:  
 [**Docker Build Instructions**](https://github.com/shadps4-emu/shadPS4/blob/main/documents/building-docker.md)
 
-> [!IMPORTANT]
-> If you want to use shadPS4 to play your games, you don't have to follow the build instructions, you can simply download the emulator from either the [**release tab**](https://github.com/shadps4-emu/shadPS4/releases) or the [**action tab**](https://github.com/shadps4-emu/shadPS4/actions).
-
 ## Windows
 
 Check the build instructions for [**Windows**](https://github.com/shadps4-emu/shadPS4/blob/main/documents/building-windows.md).
@@ -115,7 +124,23 @@ Check the build instructions for [**Linux**](https://github.com/shadps4-emu/shad
 Check the build instructions for [**macOS**](https://github.com/shadps4-emu/shadPS4/blob/main/documents/building-macos.md).
 
 > [!IMPORTANT]
-> macOS users need at least macOS 15.4 to run shadPS4. Due to GPU issues there are currently heavy bugs on Intel Macs.
+> macOS users need at least macOS 26.0 to run shadPS4. Intel Macs are not supported.
+
+# Usage examples
+
+> [!IMPORTANT]
+> For a user-friendly GUI, download the [**QtLauncher**](https://github.com/shadps4-emu/shadps4-qtlauncher/releases).
+
+To get the list of all available commands and also a more detailed description of what each command does, please refer to the `--help` flag's output.
+
+Below is a list of commonly used command patterns:
+```sh
+shadPS4 CUSA00001 # Searches for a game folder called CUSA00001 in the list of game install folders, and boots it.
+shadPS4 --fullscreen true --config-clean CUSA00001    # the game argument is always the last one,
+shadPS4 -g CUSA00001 --fullscreen true --config-clean # ...unless manually specified otherwise.
+shadPS4 /path/to/game.elf # Boots a PS4 ELF file directly. Useful if you want to boot an executable that is not named eboot.bin.
+shadPS4 CUSA00001 -- -flag1 -flag2 # Passes '-flag1' and '-flag2' to the game executable in argv.
+```
 
 # Debugging and reporting issues
 
@@ -176,13 +201,15 @@ The following firmware modules are supported and must be placed in shadPS4's `sy
 
 | Modules                        | Modules                        | Modules                        | Modules                        |
 |--------------------------------|--------------------------------|--------------------------------|--------------------------------|
-| libSceAudiodec.sprx            | libSceAudiodecCpu.sprx         | libSceAudiodecCpuDdp.sprx      | libSceAudiodecCpuDtsHdLbr.sprx |
-| libSceAudiodecCpuHevag.sprx    | libSceAudiodecCpuM4aac.sprx    | libSceCesCs.sprx               | libSceFont.sprx                |
-| libSceFontFt.sprx              | libSceFreeTypeOl.sprx          | libSceFreeTypeOptOl.sprx       | libSceFreeTypeOt.sprx          |
-| libSceJpegDec.sprx             | libSceJpegEnc.sprx             | libSceJson.sprx                | libSceJson2.sprx               |
-| libSceLibcInternal.sprx        | libSceNgs2.sprx                | libScePngEnc.sprx              | libSceRtc.sprx                 |
-| libSceRudp.sprx                | libSceSystemGesture.sprx       | libSceUlt.sprx                 | libSceWkFontConfig.sprx        |
-| libSceXml.sprx                 | libSceAt9Enc.sprx              |
+| libSceAt9Enc.sprx              | libSceAudiodec.sprx            | libSceAudiodecCpu.sprx         | libSceAudiodecCpuDdp.sprx      |
+| libSceAudiodecCpuDtsHdLbr.sprx | libSceAudiodecCpuHevag.sprx    | libSceAudiodecCpuM4aac.sprx    | libSceAvPlayer.sprx            |
+| libSceAvPlayerStreaming.sprx   | libSceBeisobmf.sprx            | libSceBemp2sys.sprx            | libSceCesCs.sprx               |
+| libSceFont.sprx                | libSceFontFt.sprx              | libSceFreeTypeOl.sprx          | libSceFreeTypeOptOl.sprx       |
+| libSceFreeTypeOt.sprx          | libSceJpegDec.sprx             | libSceJpegEnc.sprx             | libSceJson.sprx                |
+| libSceJson2.sprx               | libSceLibcInternal.sprx        | libSceNgs2.sprx                | libScePngEnc.sprx              |
+| libScePsmKitSystem.sprx        | libSceRtc.sprx                 | libSceRudp.sprx                | libSceSystemGesture.sprx       |
+| libSceUlt.sprx                 | libSceWkFontConfig.sprx        | libSceXml.sprx                 | libSceDepth.sprx               |
+| libScePadTracker.sprx          | libSceMoveTracker.sprx         |
 </div>
 
 > [!Caution]
@@ -190,8 +217,13 @@ The following firmware modules are supported and must be placed in shadPS4's `sy
 
 
 
-# Main team
+# Main team / Geliştiriciler
 
+### Custom Build Developers
+- **Eye Of The Ruins**
+- **0xDeftones**
+
+### Upstream shadPS4 Team
 - [**georgemoralis**](https://github.com/georgemoralis)
 - [**psucien**](https://github.com/psucien)
 - [**viniciuslrangel**](https://github.com/viniciuslrangel)
@@ -211,15 +243,6 @@ Logo is done by [**Xphalnos**](https://github.com/Xphalnos)
 
 If you want to contribute, please read the [**CONTRIBUTING.md**](https://github.com/shadps4-emu/shadPS4/blob/main/CONTRIBUTING.md) file.\
 Open a PR and we'll check it :)
-
-# Translations
-
-If you want to translate shadPS4 to your language we use [**Crowdin**](https://crowdin.com/project/shadps4-emulator).
-# Contributors
-
-<a href="https://github.com/shadps4-emu/shadPS4/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=shadps4-emu/shadPS4&max=24">
-</a>
 
 
 # Special Thanks

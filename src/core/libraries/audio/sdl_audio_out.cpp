@@ -9,8 +9,8 @@
 #include <SDL3/SDL_audio.h>
 #include <SDL3/SDL_hints.h>
 
-#include "common/config.h"
 #include "common/logging/log.h"
+#include "core/emulator_settings.h"
 #include "core/libraries/audio/audioout.h"
 #include "core/libraries/audio/audioout_backend.h"
 #include "core/libraries/kernel/threads.h"
@@ -96,6 +96,7 @@ public:
 
         last_output_time.store(current_time, std::memory_order_release);
     }
+
     void SetVolume(const std::array<int, 8>& ch_volumes) override {
         if (!stream) [[unlikely]] {
             return;
@@ -110,18 +111,15 @@ public:
         }
         game_gain.store(max_channel_gain, std::memory_order_release);
 
-        const float slider_gain = Config::getVolumeSlider() * 0.01f;
-        float total_gain = max_channel_gain * slider_gain;
-
-        if (Config::isMuteEnabled()) {
-            total_gain = 0.0f;
-        }
+        const float slider_gain = EmulatorSettings.GetVolumeSlider() * 0.01f; // Faster than /100.0f
+        const float total_gain = max_channel_gain * slider_gain;
 
         const float current = current_gain.load(std::memory_order_acquire);
         if (std::abs(total_gain - current) < VOLUME_EPSILON) {
             return;
         }
 
+        // Apply volume change
         if (SDL_SetAudioStreamGain(stream, total_gain)) {
             current_gain.store(total_gain, std::memory_order_release);
             LOG_DEBUG(Lib_AudioOut,
@@ -130,6 +128,10 @@ public:
         } else {
             LOG_ERROR(Lib_AudioOut, "Failed to set audio stream gain: {}", SDL_GetError());
         }
+    }
+
+    u64 GetLastOutputTime() const {
+        return last_output_time.load(std::memory_order_acquire);
     }
 
 private:
@@ -155,7 +157,7 @@ private:
         }
 
         // Initialize current gain
-        current_gain.store(Config::getVolumeSlider() * 0.01f, std::memory_order_relaxed);
+        current_gain.store(EmulatorSettings.GetVolumeSlider() * 0.01f, std::memory_order_relaxed);
 
         if (!OpenDevice(type)) {
             FreeAlignedBuffer();
@@ -199,14 +201,11 @@ private:
 
         last_volume_check_time = current_time;
 
-        float config_volume = Config::getVolumeSlider() * 0.01f;
-
-        if (Config::isMuteEnabled()) {
-            config_volume = 0.0f;
-        }
-
+        const float config_volume =
+            EmulatorSettings.GetVolumeSlider() * 0.01f * game_gain.load(std::memory_order_acquire);
         const float stored_gain = current_gain.load(std::memory_order_acquire);
 
+        // Only update if the difference is significant
         if (std::abs(config_volume - stored_gain) > VOLUME_EPSILON) {
             if (SDL_SetAudioStreamGain(stream, config_volume)) {
                 current_gain.store(config_volume, std::memory_order_release);
@@ -392,11 +391,11 @@ private:
         switch (type) {
         case OrbisAudioOutPort::Main:
         case OrbisAudioOutPort::Bgm:
-            return Config::getMainOutputDevice();
+            return EmulatorSettings.GetSDLMainOutputDevice();
         case OrbisAudioOutPort::PadSpk:
-            return Config::getPadSpkOutputDevice();
+            return EmulatorSettings.GetSDLPadSpkOutputDevice();
         default:
-            return Config::getMainOutputDevice();
+            return EmulatorSettings.GetSDLMainOutputDevice();
         }
     }
 

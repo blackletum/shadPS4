@@ -5,6 +5,7 @@
 
 #include <condition_variable>
 #include <coroutine>
+#include <cstring>
 #include <exception>
 #include <mutex>
 #include <semaphore>
@@ -62,6 +63,10 @@ struct Liverpool {
     Regs regs{};
     std::array<CbDbExtent, NUM_COLOR_BUFFERS> last_cb_extent{};
     CbDbExtent last_db_extent{};
+    /// Changes whenever packets that set config, context or uconfig registers change what they
+    /// hold, or clear them. Registers draw packets set themselves, like index and instance
+    /// counts, and shader registers aren't covered.
+    u64 context_regs_version{1};
 
 public:
     explicit Liverpool();
@@ -97,9 +102,6 @@ public:
 
     template <bool wait_done = false>
     void SendCommand(auto&& func) {
-        if (std::this_thread::get_id() == gpu_id) {
-            return func();
-        }
         if constexpr (wait_done) {
             std::binary_semaphore sem{0};
             {
@@ -141,9 +143,30 @@ public:
         std::array<u32, Pm4BufferSize> tmp_packet;
         u32 tmp_dwords;
     };
-    Common::SlotVector<AscQueueInfo> asc_queues{};
+    Common::SlotVector<AscQueueInfo> asc_queues{64};
+
+    std::thread::id GetGpuCommandProcessorThread() {
+        return gpu_id;
+    }
+
+#ifdef __linux__
+    u32 GetGpuCommandProcessorThreadId() {
+        return gpu_tid;
+    }
+#endif
 
 private:
+    /// Writes registers a packet sets, and changes the version if what they hold changes. Games
+    /// set much the same state again for every draw.
+    void SetContextRegs(u32 reg_addr, const u32* values, u32 num_regs) {
+        u32* dst = &regs.reg_array[reg_addr];
+        const size_t size = num_regs * sizeof(u32);
+        if (std::memcmp(dst, values, size) != 0) {
+            std::memcpy(dst, values, size);
+            ++context_regs_version;
+        }
+    }
+
     struct Task {
         struct promise_type {
             auto get_return_object() {
@@ -222,6 +245,7 @@ private:
 
     Vulkan::Rasterizer* rasterizer{};
     Libraries::VideoOut::VideoOutPort* vo_port{};
+    const bool guest_markers_enabled;
     std::jthread process_thread{};
     std::atomic<u32> num_submits{};
     std::atomic<u32> num_commands{};
@@ -230,6 +254,9 @@ private:
     std::condition_variable_any submit_cv;
     std::queue<Common::UniqueFunction<void>> command_queue{};
     std::thread::id gpu_id;
+#ifdef __linux__
+    u32 gpu_tid;
+#endif
     s32 curr_qid{-1};
 };
 

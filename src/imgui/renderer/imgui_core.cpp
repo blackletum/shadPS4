@@ -1,12 +1,13 @@
-// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cstdint>
 #include <SDL3/SDL_events.h>
 #include <imgui.h>
 
-#include "common/config.h"
 #include "common/path_util.h"
 #include "core/debug_state.h"
 #include "core/devtools/layer.h"
@@ -89,7 +90,7 @@ void Initialize(const ::Vulkan::Instance& instance, const Frontend::WindowSDL& w
     font_cfg.OversampleH = 2;
     font_cfg.OversampleV = 1;
     io.Fonts->Flags |= ImFontAtlasFlags_NoPowerOfTwoHeight;
-    const int console_language = Config::GetLanguage();
+    const int console_language = EmulatorSettings.GetConsoleLanguage();
     io.FontDefault = FontStack::AddPrimaryUiFont(io.Fonts, 32.0f, console_language, font_cfg, true);
 
     io.Fonts->AddFontFromMemoryCompressedTTF(imgui_font_proggyvector_regular_compressed_data,
@@ -98,7 +99,17 @@ void Initialize(const ::Vulkan::Instance& instance, const Frontend::WindowSDL& w
 
     // Avoid exploding atlas size on Metal/MoltenVK when CJK fallback is enabled.
     FontStack::AddPrimaryUiFont(io.Fonts, 128.0f, console_language, font_cfg, false);
-    io.Fonts->Build();
+
+    // Big Picture
+    FontStack::AddPrimaryUiFont(ImGui::GetIO().Fonts, 64.0f, EmulatorSettings.GetConsoleLanguage(),
+                                font_cfg, true);
+
+    // Let the atlas size grow to the largest image the device can create,
+    // floored to the power of two the packer requires.
+    const u32 max_dim = instance.GetPhysicalDevice().getProperties().limits.maxImageDimension2D;
+    const int atlas_max = static_cast<int>(std::bit_floor(std::max<u32>(max_dim, 512u)));
+    io.Fonts->TexMaxWidth = atlas_max;
+    io.Fonts->TexMaxHeight = atlas_max;
 
     io.FontGlobalScale = 0.5f;
 
@@ -226,6 +237,7 @@ ImGuiID NewFrame(bool is_reusing_frame) {
 
     Sdl::NewFrame(is_reusing_frame);
     ImGui::NewFrame();
+    SetKeyOwner(ImGuiKey_GamepadFaceUp, ImHashStr("shadps4/pad"));
 
     ImGuiWindowFlags flags =
         ImGuiDockNodeFlags_PassthruCentralNode | ImGuiDockNodeFlags_AutoHideTabBar;
@@ -245,11 +257,13 @@ void Render(const vk::CommandBuffer& cmdbuf, const vk::ImageView& image_view,
             const vk::Extent2D& extent) {
     ImGui::Render();
     ImDrawData* draw_data = GetDrawData();
+    // Font atlas uploads are recorded ahead of the render pass that samples them.
+    Vulkan::UpdateTextures(*draw_data, cmdbuf);
     if (draw_data->CmdListsCount == 0) {
         return;
     }
 
-    if (Config::getVkHostMarkersEnabled()) {
+    if (EmulatorSettings.IsVkHostMarkersEnabled()) {
         cmdbuf.beginDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{
             .pLabelName = "ImGui Render",
         });
@@ -274,13 +288,14 @@ void Render(const vk::CommandBuffer& cmdbuf, const vk::ImageView& image_view,
     cmdbuf.beginRendering(render_info);
     Vulkan::RenderDrawData(*draw_data, cmdbuf);
     cmdbuf.endRendering();
-    if (Config::getVkHostMarkersEnabled()) {
+    if (EmulatorSettings.IsVkHostMarkersEnabled()) {
         cmdbuf.endDebugUtilsLabelEXT();
     }
 }
 
 bool MustKeepDrawing() {
-    return layers.size() > 1 || change_layers.size() > 1 || DebugState.IsShowingDebugMenuBar();
+    return std::ranges::any_of(layers, [](Layer* layer) { return layer->ShouldKeepDrawing(); }) ||
+           change_layers.size() > 1;
 }
 
 } // namespace Core

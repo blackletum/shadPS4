@@ -1,398 +1,260 @@
-// SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <filesystem>
-#include <functional>
 #include <iostream>
+#include <memory>
 #include <optional>
-#include <string>
-#include <system_error>
-#include <unordered_map>
+#include <span>
 #include <vector>
+#include <CLI/CLI.hpp>
 #include <SDL3/SDL_messagebox.h>
-#include <core/emulator_state.h>
+#include <fmt/format.h>
+#include <fmt/ranges.h>
 
-#include "functional"
-#include "iostream"
-#include "string"
-#include "system_error"
-#include "unordered_map"
-
-#include <fmt/core.h>
-#include "common/config.h"
-#include "common/logging/backend.h"
+#include "common/arch.h"
+#include "common/key_manager.h"
+#include "common/logging/log.h"
 #include "common/memory_patcher.h"
 #include "common/path_util.h"
-#include "common/zar_fs.h"
 #include "core/debugger.h"
+#include "core/emulator_settings.h"
+#include "core/emulator_state.h"
 #include "core/file_sys/fs.h"
 #include "core/ipc/ipc.h"
+#include "core/user_settings.h"
 #include "emulator.h"
-#include "imgui/big_picture.h"
+#include "imgui/big_picture/big_picture.h"
 
 #ifdef _WIN32
-#include <shellapi.h>
 #include <windows.h>
-#endif
-#include <common/key_manager.h>
-
-static void OpenURL(const char* url) {
-#ifdef _WIN32
-    ShellExecuteA(nullptr, "open", url, nullptr, nullptr, SW_SHOWNORMAL);
 #elif defined(__APPLE__)
-    std::string cmd = std::string("open ") + url;
-    std::system(cmd.c_str());
-#else
-    std::string cmd = std::string("xdg-open ") + url;
-    std::system(cmd.c_str());
+#include <sys/sysctl.h>
 #endif
-}
 
 int main(int argc, char* argv[]) {
 #ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
 #endif
 
-    IPC::Instance().Init();
-    // Init emulator state
-    std::shared_ptr<EmulatorState> m_emu_state = std::make_shared<EmulatorState>();
-    EmulatorState::SetInstance(m_emu_state);
-
-    {
-        auto portable = Common::FS::GetPortablePath();
-        auto init_state = std::filesystem::exists(portable) ? Common::FS::PathInitState::Portable
-                                                            : Common::FS::PathInitState::Global;
-        Common::FS::InitializeUserPaths(init_state);
+#if defined(__APPLE__) && defined(ARCH_X86_64)
+    // KosmicKrisp only supports Apple Silicon. Check that we are not running on an Intel Mac.
+    int sysctl_ret = 0;
+    size_t sysctl_size = sizeof(sysctl_ret);
+    sysctlbyname("sysctl.proc_translated", &sysctl_ret, &sysctl_size, nullptr, 0);
+    if (sysctl_ret != 1) {
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "shadPS4",
+                                 "shadPS4 only supports Apple Silicon Macs.", nullptr);
+        std::cout << "shadPS4 only supports Apple Silicon Macs." << std::endl;
+        return -1;
     }
+#endif
 
-    const auto user_dir = Common::FS::GetUserPath(Common::FS::PathType::UserDir);
-    Config::load(user_dir / "config.toml");
-    // temp copy the trophy key from old config to key manager if exists
-    auto key_manager = KeyManager::GetInstance();
-    key_manager->LoadFromFile();
-    if (key_manager->GetAllKeys().TrophyKeySet.ReleaseTrophyKey.empty() &&
-        !Config::getTrophyKey().empty()) {
-        auto keys = key_manager->GetAllKeys();
-        if (keys.TrophyKeySet.ReleaseTrophyKey.empty() && !Config::getTrophyKey().empty()) {
-            keys.TrophyKeySet.ReleaseTrophyKey =
-                KeyManager::HexStringToBytes(Config::getTrophyKey());
-            key_manager->SetAllKeys(keys);
-            key_manager->SaveToFile();
-        }
-    }
-    bool has_game_argument = false;
-    bool has_emulator_argument = false;
-    bool show_gui = false;
-    bool no_ipc = false;
-    bool waitForDebugger = false;
-    bool big_picture_mode = false;
+    CLI::App app{"shadPS4 Emulator CLI"};
 
-    std::string gamePath;
-    std::string emulatorPath;
-    std::vector<std::string> gameArgs{};
-    std::vector<std::string> emulatorArgs{};
-    std::optional<std::filesystem::path> gameFolder;
-    std::optional<std::filesystem::path> modsFolder;
+    // ---- CLI state ----
+    std::optional<std::string> gamePath;
+    std::vector<std::string> gameArgs;
+    std::optional<std::filesystem::path> overrideRoot;
     std::optional<int> waitPid;
+    bool waitForDebugger = false;
+    bool userfaultfd = false;
 
-    std::unordered_map<std::string, std::function<void(int&)>> arg_map = {
-        {"-h",
-         [&](int&) {
-             std::cout << "Usage: shadps4 [options] <elf or eboot.bin path>\n"
-                          "Options:\n"
-                          "  -g, --game <path|ID>          Specify game path or ID to launch\n"
-                          "  -e, --emulator <path|name>    Specify emulator executable path or "
-                          "version name\n"
-                          "  -d                            Alias for '-e default'\n"
-                          "  -p, --patch <file>            Apply specified patch file\n"
-                          "  -mf, --mods-folder <folder>   Specify mods folder path\n"
-                          "  -i, --ignore-game-patch       Disable automatic game patch loading\n"
-                          "  -f, --fullscreen <true|false> Set initial fullscreen state (does not "
-                          "overwrite config)\n"
-                          "  -s, --show-gui                Show GUI mode\n"
-                          "  -b, --bigpicture              Launch in Big Picture mode\n"
-                          "  -I, --no-ipc                  Disable IPC subsystem\n"
-                          "  --show-fps                    Enable FPS counter display at startup\n"
-                          "  --add-game-folder <folder>    Add a new game folder to config\n"
-                          "  --set-addon-folder <folder>   Set the addon folder in config\n"
-                          "  --log-append                  Append logs instead of overwriting\n"
-                          "  --override-root <folder>      Override game root directory\n"
-                          "  --wait-for-debugger           Wait for debugger attach\n"
-                          "  --wait-for-pid <pid>          Wait for process with given PID\n"
-                          "  --config-clean                Use clean config (ignore all files)\n"
-                          "  --config-global               Use only global config file\n"
-                          "  -- ...                        Pass remaining args to the game ELF or "
-                          "emulator\n"
-                          "  -h, --help                    Show this help message\n";
-             exit(0);
-         }},
-        {"--help", [&](int& i) { arg_map["-h"](i); }},
+    std::optional<std::string> fullscreenStr;
+    bool ignoreGamePatch = false;
+    bool showFps = false;
+    bool configClean = false;
+    bool configGlobal = false;
+    bool bigPicture = false;
+    bool sameProcess = false;
+    bool append_log{};
 
-        {"-g",
-         [&](int& i) {
-             if (i + 1 < argc) {
-                 gamePath = argv[++i];
-                 has_game_argument = true;
-             } else {
-                 std::cerr << "Error: Missing argument for -g/--game\n";
-                 exit(1);
-             }
-         }},
-        {"--game", [&](int& i) { arg_map["-g"](i); }},
+    std::optional<std::filesystem::path> addGameFolder;
+    std::optional<std::filesystem::path> setAddonFolder;
+    std::optional<std::string> patchFile;
 
-        {"-e",
-         [&](int& i) {
-             if (i + 1 < argc) {
-                 emulatorPath = argv[++i];
-                 has_emulator_argument = true;
-             } else {
-                 std::cerr << "Error: Missing argument for -e/--emulator\n";
-                 exit(1);
-             }
-         }},
-        {"--emulator", [&](int& i) { arg_map["-e"](i); }},
-        {"-d",
-         [&](int&) {
-             emulatorPath = "default";
-             has_emulator_argument = true;
-         }},
+    std::vector<std::pair<std::filesystem::path, std::string>> mounts;
+    static std::vector<std::string> env_vars;
 
-        {"-f",
-         [&](int& i) {
-             if (++i >= argc) {
-                 std::cerr << "Error: Missing argument for -f/--fullscreen\n";
-                 exit(1);
-             }
-             std::string val(argv[i]);
-             if (val == "true")
-                 Config::setIsFullscreen(true);
-             else if (val == "false")
-                 Config::setIsFullscreen(false);
-             else {
-                 std::cerr << "Error: Invalid fullscreen argument, use 'true' or 'false'.\n";
-                 exit(1);
-             }
-         }},
-        {"--fullscreen", [&](int& i) { arg_map["-f"](i); }},
+    // ---- Options ----
+    app.add_option("guest_arg", gamePath, "Game path or ID"); // positional
+    app.add_option("-g,--game", gamePath, "Game path or ID");
+    app.add_option("-p,--patch", patchFile, "Patch file to apply");
+    app.add_flag("-i,--ignore-game-patch", ignoreGamePatch,
+                 "Disable automatic loading of game patches");
 
-        {"-s", [&](int&) { show_gui = true; }},
-        {"--show-gui", [&](int& i) { arg_map["-s"](i); }},
-        {"-b", [&](int&) { big_picture_mode = true; }},
-        {"--bigpicture", [&](int& i) { arg_map["-b"](i); }},
-        {"-I", [&](int&) { no_ipc = true; }},
-        {"--no-ipc", [&](int& i) { arg_map["-I"](i); }},
+    app.add_flag("-b,--big-picture", bigPicture, "Start in Big Picture Mode");
+    app.add_flag("--same-process", sameProcess,
+                 "Launch the game in the same process when using Big Picture Mode");
 
-        {"-p",
-         [&](int& i) {
-             if (i + 1 < argc)
-                 MemoryPatcher::patch_file = argv[++i];
-             else {
-                 std::cerr << "Error: Missing argument for -p/--patch\n";
-                 exit(1);
-             }
-         }},
-        {"--patch", [&](int& i) { arg_map["-p"](i); }},
-        {"-i", [&](int&) { Core::FileSys::MntPoints::ignore_game_patches = true; }},
-        {"--ignore-game-patch", [&](int& i) { arg_map["-i"](i); }},
-        {"-im",
-         [&](int&) {
-             Core::FileSys::MntPoints::enable_mods = false;
-             Core::FileSys::MntPoints::manual_mods_path.clear();
-         }},
-        {"--ignore-mods-path", [&](int& i) { arg_map["-im"](i); }},
-        {"-mf",
-         [&](int& i) {
-             if (i + 1 < argc) {
-                 std::filesystem::path dir(argv[++i]);
-                 if (!std::filesystem::exists(dir) || !std::filesystem::is_directory(dir)) {
-                     std::cerr << "Error: Invalid mods folder: " << dir << "\n";
-                     exit(1);
-                 }
-                 Core::FileSys::MntPoints::enable_mods = true;
-                 Core::FileSys::MntPoints::manual_mods_path = dir;
-                 modsFolder = dir;
-                 std::cout << "Mods folder set: " << dir << "\n";
-             } else {
-                 std::cerr << "Error: Missing argument for -mf/--mods-folder\n";
-                 exit(1);
-             }
-         }},
-        {"--mods-folder", [&](int& i) { arg_map["-mf"](i); }},
+    app.add_option("-f,--fullscreen", fullscreenStr, "Fullscreen mode (true|false)");
 
-        {"--config-clean", [&](int&) { Config::setConfigMode(Config::ConfigMode::Clean); }},
-        {"--config-global", [&](int&) { Config::setConfigMode(Config::ConfigMode::Global); }},
+    app.add_option("--override-root", overrideRoot)->check(CLI::ExistingDirectory);
 
-        {"--add-game-folder",
-         [&](int& i) {
-             if (++i >= argc)
-                 exit((std::cerr << "Error: Missing argument for --add-game-folder\n", 1));
-             std::filesystem::path dir(argv[i]);
-             if (!std::filesystem::exists(dir))
-                 exit((std::cerr << "Error: Directory not found: " << dir << "\n", 1));
-             Config::addGameDirectories(dir);
-             Config::save(user_dir / "config.toml");
-             std::cout << "Game folder saved.\n";
-             exit(0);
-         }},
-        {"--set-addon-folder",
-         [&](int& i) {
-             if (++i >= argc)
-                 exit((std::cerr << "Error: Missing argument for --set-addon-folder\n", 1));
-             std::filesystem::path dir(argv[i]);
-             if (!std::filesystem::exists(dir))
-                 exit((std::cerr << "Error: Directory not found: " << dir << "\n", 1));
-             Config::setAddonDirectories(dir);
-             Config::save(user_dir / "config.toml");
-             std::cout << "Addon folder saved.\n";
-             exit(0);
-         }},
+    app.add_flag("--wait-for-debugger", waitForDebugger);
+    app.add_option("--wait-for-pid", waitPid);
+#ifdef __linux__
+    app.add_flag("--userfaultfd", userfaultfd,
+                 "Enable userfaultfd for tracking memory (Linux only)");
+#endif
 
-        {"--log-append", [&](int&) { Common::Log::SetAppend(); }},
-        {"--override-root",
-         [&](int& i) {
-             if (++i >= argc)
-                 exit((std::cerr << "Error: Missing argument for --override-root\n", 1));
-             std::filesystem::path folder(argv[i]);
-             if (!std::filesystem::exists(folder) || !std::filesystem::is_directory(folder))
-                 exit((std::cerr << "Error: Invalid folder: " << folder << "\n", 1));
-             gameFolder = folder;
-         }},
+    app.add_flag("--show-fps", showFps);
+    app.add_flag("--config-clean", configClean);
+    app.add_flag("--config-global", configGlobal);
+    app.add_flag("--log-append", append_log);
 
-        {"--wait-for-debugger", [&](int& i) { waitForDebugger = true; }},
-        {"--wait-for-pid",
-         [&](int& i) {
-             if (++i >= argc) {
-                 std::cerr << "Error: Missing argument for --wait-for-pid\n";
-                 exit(1);
-             }
-             waitPid = std::stoi(argv[i]);
-         }},
-        {"--show-fps", [&](int& i) { Config::setShowFpsCounter(true); }}};
+    app.add_option("--add-game-folder", addGameFolder)->check(CLI::ExistingDirectory);
+    app.add_option("--set-addon-folder", setAddonFolder)->check(CLI::ExistingDirectory);
+    app.add_option("--mount", mounts, "Mount source to destination");
+    app.add_option("-e,--env", env_vars, "Environment variables to pass to the guest");
 
+    // ---- Capture args after `--` verbatim ----
+    app.allow_extras();
+
+    // ---- No-args behavior ----
     if (argc == 1) {
-        const char* repo_url = "https://github.com/diegolix29/shadPS4/releases";
-
-        const SDL_MessageBoxButtonData buttons[] = {
-            {SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT, 0, "OK"}, {0, 1, "Open Repo"}};
-
-        const SDL_MessageBoxData messageboxdata = {
-            SDL_MESSAGEBOX_INFORMATION,
-            nullptr,
-            "shadPS4",
-            "This is a CLI application.\n\n"
-            "Use QTLauncher or Shadlix version to use it.\n\n"
-            "Or use the QT Shadlix for a GUI.",
-            SDL_arraysize(buttons),
-            buttons,
-            nullptr};
-
-        int buttonid = -1;
-        if (SDL_ShowMessageBox(&messageboxdata, &buttonid) < 0) {
-            std::cerr << "Could not display SDL message box! Error: " << SDL_GetError() << "\n";
-        }
-
-        if (buttonid == 1) {
-            OpenURL(repo_url);
-        }
-
-        int dummy = 0;
-        arg_map.at("-h")(dummy);
+        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, "shadPS4",
+                                 "This is a CLI application. Please use the '-b' flag for Big "
+                                 "Picture mode, or QTLauncher for a standalone GUI:\n"
+                                 "https://github.com/shadps4-emu/shadps4-qtlauncher/releases",
+                                 nullptr);
+        std::cout << app.help();
         return -1;
     }
 
-    for (int i = 1; i < argc; ++i) {
-        std::string cur_arg = argv[i];
-        auto it = arg_map.find(cur_arg);
-        if (it != arg_map.end()) {
-            it->second(i);
-        } else if (std::string(argv[i]) == "--") {
-            for (int j = i + 1; j < argc; ++j)
-                (has_emulator_argument ? emulatorArgs : gameArgs).push_back(argv[j]);
-            break;
-        } else if (i == argc - 1 && !has_game_argument) {
-            gamePath = argv[i];
-            has_game_argument = true;
-        } else {
-            std::cerr << "Unknown argument: " << cur_arg << "\n";
+    try {
+        bool double_dash_found = false;
+        int double_dash_index;
+        for (int i = 0; i < argc; i++) {
+            if (double_dash_found) {
+                gameArgs.emplace_back(argv[i]);
+            }
+            if (!double_dash_found && std::string(argv[i]) == "--") {
+                double_dash_found = true;
+                double_dash_index = i;
+            }
         }
-    }
-    if (!gameArgs.empty()) {
-        if (gameArgs.front() == "--") {
-            gameArgs.erase(gameArgs.begin());
+
+        // If the -- arg is present, only parse args before it
+        if (double_dash_found) {
+            app.parse(double_dash_index, argv);
         } else {
-            std::cerr << "Error: unhandled flags\n";
-            return 1;
+            app.parse(argc, argv);
         }
+    } catch (const CLI::ParseError& e) {
+        return app.exit(e);
     }
 
-    if (has_emulator_argument && !has_game_argument) {
-        gamePath = emulatorPath;
-        has_game_argument = true;
-        for (const auto& a : emulatorArgs)
-            gameArgs.push_back(a);
-    }
+    if (waitPid)
+        Core::Debugger::WaitForPid(*waitPid);
 
-    if (big_picture_mode) {
-        if (has_game_argument) {
-            std::cerr << "Error: Big picture mode cannot be used with a specific game. Use big "
-                         "picture mode to select games.\n";
-            return 1;
-        }
-        BigPictureMode::Launch();
+    // Initialize main log with default config
+    Common::Log::Setup("shadps4.log");
+
+    LOG_INFO(Debug, "Run: {}", fmt::join(std::span(argv, argc), " "));
+
+    IPC::Instance().Init();
+
+    // Initialize key manager
+    KeyManager::GetInstance()->LoadFromFile();
+
+    // Load configurations
+    EmulatorSettings.Load();
+    UserSettings.Load();
+
+    if (bigPicture) {
+        BigPictureMode::Launch(argv[0], sameProcess);
         return 0;
     }
 
-    std::filesystem::path ebootPath(gamePath);
-    if (!Common::FS::Zar::Exists(ebootPath)) {
-        bool found = false;
-        const int max_depth = 5;
-        for (const auto& dir : Config::getGameDirectories()) {
-            if (auto found_path = Common::FS::FindGameByID(dir, gamePath, max_depth)) {
-                ebootPath = *found_path;
-                found = true;
-                break;
+    // ---- Utility commands ----
+    if (addGameFolder) {
+        EmulatorSettings.AddGameInstallDir(*addGameFolder);
+        EmulatorSettings.Save();
+        LOG_INFO(Config, "Game folder successfully saved.");
+        return 0;
+    }
+
+    if (setAddonFolder) {
+        EmulatorSettings.SetAddonInstallDir(*setAddonFolder);
+        EmulatorSettings.Save();
+        LOG_INFO(Config, "Addon folder successfully saved.");
+        return 0;
+    }
+
+    if (!gamePath.has_value()) {
+        if (!gameArgs.empty()) {
+            gamePath = gameArgs.front();
+            gameArgs.erase(gameArgs.begin());
+        } else {
+            LOG_ERROR(Debug, "Please provide a game path or ID.");
+            return 1;
+        }
+    }
+
+    // ---- Apply flags ----
+    if (patchFile)
+        MemoryPatcher::patch_file = *patchFile;
+
+    if (ignoreGamePatch)
+        Core::FileSys::MntPoints::ignore_game_patches = true;
+
+    if (fullscreenStr) {
+        if (*fullscreenStr == "true") {
+            EmulatorSettings.SetFullScreen(true);
+        } else if (*fullscreenStr == "false") {
+            EmulatorSettings.SetFullScreen(false);
+        } else {
+            LOG_ERROR(Debug, "Invalid argument for --fullscreen (use true|false)");
+            return 1;
+        }
+    }
+
+    if (showFps)
+        EmulatorSettings.SetShowFpsCounter(true);
+
+    if (configClean)
+        EmulatorSettings.SetConfigMode(ConfigMode::Clean);
+
+    if (configGlobal)
+        EmulatorSettings.SetConfigMode(ConfigMode::Global);
+
+    if (userfaultfd) {
+        EmulatorSettings.SetUserfaultfdTracking(true);
+    }
+
+    // ---- Resolve game path or ID ----
+    std::filesystem::path ebootPath(*gamePath);
+    const auto archive_component_exists = [](const std::filesystem::path& p) -> bool {
+        std::filesystem::path accum;
+        for (const auto& comp : p) {
+            accum /= comp;
+            if (comp.extension() == ".zar") {
+                return std::filesystem::is_regular_file(accum);
             }
-            if (auto foundPath = Common::FS::Zar::FindGameByID(dir, gamePath, max_depth)) {
+        }
+        return false;
+    };
+    if (!std::filesystem::exists(ebootPath) && !archive_component_exists(ebootPath)) {
+        bool found = false;
+        constexpr int maxDepth = 5;
+        for (const auto& installDir : EmulatorSettings.GetGameInstallDirs()) {
+            if (auto foundPath = Common::FS::FindGameByID(installDir, *gamePath, maxDepth)) {
                 ebootPath = *foundPath;
                 found = true;
                 break;
             }
         }
         if (!found) {
-            std::cerr << "Error: Game not found: " << gamePath << "\n";
+            LOG_ERROR(Debug, "Game ID or file path not found: {}", *gamePath);
             return 1;
         }
     }
 
-    if (!modsFolder.has_value()) {
-        const auto mods_overlay = Common::FS::Zar::GetOverlayPath(ebootPath.parent_path(), "-MODS");
-        if (Common::FS::Zar::Exists(mods_overlay)) {
-            modsFolder = mods_overlay;
-            Core::FileSys::MntPoints::manual_mods_path = mods_overlay;
-            Core::FileSys::MntPoints::enable_mods = true;
-            std::cout << "Auto-detected mods overlay: " << mods_overlay << "\n";
-        }
-    } else {
-        std::cout << "Using manually specified mods folder: " << modsFolder->string() << "\n";
-    }
-
-    const auto patch_overlay = Common::FS::Zar::GetOverlayPath(ebootPath.parent_path(), "-UPDATE");
-    if (Common::FS::Zar::Exists(patch_overlay)) {
-        std::cout << "Auto-detected patch/update overlay: " << patch_overlay << "\n";
-    }
-
-    if (!Core::FileSys::MntPoints::enable_mods) {
-        modsFolder.reset();
-        Core::FileSys::MntPoints::manual_mods_path.clear();
-    }
-
-    if (waitPid)
-        Core::Debugger::WaitForPid(*waitPid);
-
-    Core::Emulator* emulator = Common::Singleton<Core::Emulator>::Instance();
+    auto* emulator = Common::Singleton<Core::Emulator>::Instance();
     emulator->executableName = argv[0];
     emulator->waitForDebuggerBeforeRun = waitForDebugger;
-    emulator->Run(ebootPath, gameArgs, gameFolder);
+    emulator->Run(ebootPath, gameArgs, overrideRoot, mounts, env_vars, append_log);
 
     return 0;
 }

@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 // Include the vulkan platform specific header
@@ -17,9 +17,9 @@
 #include <fmt/ranges.h>
 
 #include "common/assert.h"
-#include "common/config.h"
 #include "common/logging/log.h"
 #include "common/path_util.h"
+#include "core/emulator_settings.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 
@@ -52,7 +52,7 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL DebugUtilsCallback(
         level = Common::Log::Level::Info;
     }
 
-    LOG_GENERIC(Common::Log::Class::Render_Vulkan, level, "{}: {}",
+    LOG_GENERIC(Render_Vulkan, level, "{}: {}",
                 callback_data->pMessageIdName ? callback_data->pMessageIdName : "<null>",
                 callback_data->pMessage ? callback_data->pMessage : "<null>");
 
@@ -87,7 +87,7 @@ vk::SurfaceKHR CreateSurface(vk::Instance instance, const Frontend::WindowSDL& e
             UNREACHABLE();
         }
     } else if (window_info.type == Frontend::WindowSystemType::Wayland) {
-        if (Config::isRdocEnabled()) {
+        if (EmulatorSettings.IsRenderdocEnabled()) {
             LOG_ERROR(Render_Vulkan,
                       "RenderDoc is not compatible with Wayland, use an X11 window instead.");
         }
@@ -192,15 +192,11 @@ std::vector<const char*> GetInstanceExtensions(Frontend::WindowSystemType window
         break;
     }
 
-#ifdef __APPLE__
-    extensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
-#endif
-
     if (window_type != Frontend::WindowSystemType::Headless) {
         extensions.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
     }
 
-    if (Config::allowHDR()) {
+    if (EmulatorSettings.IsHdrAllowed()) {
         extensions.push_back(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
     }
 
@@ -262,14 +258,14 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
                                   bool enable_crash_diagnostic) {
     LOG_INFO(Render_Vulkan, "Creating vulkan instance");
 
-#if defined(__APPLE__) && !defined(ENABLE_QT_GUI)
-    // Initialize the environment with the path to the MoltenVK ICD, so that the loader will
+#if defined(__APPLE__)
+    // Initialize the environment with the path to the included ICD, so that the loader will
     // find it.
     static const auto icd_path = [] {
         char path[PATH_MAX];
         u32 length = PATH_MAX;
         _NSGetExecutablePath(path, &length);
-        return std::filesystem::path(path).parent_path() / "MoltenVK_icd.json";
+        return std::filesystem::path(path).parent_path();
     }();
     setenv("VK_DRIVER_FILES", icd_path.c_str(), true);
 #endif
@@ -306,18 +302,15 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
     LOG_INFO(Render_Vulkan, "Enabled instance layers: {}", layers_string);
 
     // Validation settings
-    vk::Bool32 enable_core = Config::vkValidationCoreEnabled() ? vk::True : vk::False;
-    vk::Bool32 enable_sync = Config::vkValidationSyncEnabled() ? vk::True : vk::False;
-    vk::Bool32 enable_gpuav = Config::vkValidationGpuEnabled() ? vk::True : vk::False;
+    vk::Bool32 enable_core = EmulatorSettings.IsVkValidationCoreEnabled() ? vk::True : vk::False;
+    vk::Bool32 enable_sync = EmulatorSettings.IsVkValidationSyncEnabled() ? vk::True : vk::False;
+    vk::Bool32 enable_gpuav = EmulatorSettings.IsVkValidationGpuEnabled() ? vk::True : vk::False;
 
     // Crash diagnostics settings
     static const auto crash_diagnostic_path =
         Common::FS::GetUserPathString(Common::FS::PathType::LogDir);
     const char* log_path = crash_diagnostic_path.c_str();
     vk::Bool32 enable_force_barriers = vk::True;
-#ifdef __APPLE__
-    const vk::Bool32 mvk_debug_mode = enable_crash_diagnostic ? vk::True : vk::False;
-#endif
 
     const std::array layer_setings = {
         vk::LayerSettingEXT{
@@ -404,24 +397,10 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
             .valueCount = 1,
             .pValues = &enable_force_barriers,
         },
-#ifdef __APPLE__
-        // MoltenVK debug mode turns on additional device loss error details, so
-        // use the crash diagnostic setting as an indicator of whether to turn it on.
-        vk::LayerSettingEXT{
-            .pLayerName = "MoltenVK",
-            .pSettingName = "MVK_CONFIG_DEBUG",
-            .type = vk::LayerSettingTypeEXT::eBool32,
-            .valueCount = 1,
-            .pValues = &mvk_debug_mode,
-        },
-#endif
     };
 
     vk::StructureChain<vk::InstanceCreateInfo, vk::LayerSettingsCreateInfoEXT> instance_ci_chain = {
         vk::InstanceCreateInfo{
-#ifdef __APPLE__
-            .flags = vk::InstanceCreateFlagBits::eEnumeratePortabilityKHR,
-#endif
             .pApplicationInfo = &application_info,
             .enabledLayerCount = static_cast<u32>(layers.size()),
             .ppEnabledLayerNames = layers.data(),

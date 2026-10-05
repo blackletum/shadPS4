@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <fmt/format.h>
+
 #include "common/assert.h"
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/kernel/posix_error.h"
@@ -229,7 +231,7 @@ int PthreadCond::Signal(Pthread* thread) {
         if (ret != ORBIS_OK) {
             return ret;
         }
-        thread->lock.unlock();
+        thread->lock->unlock();
     }
 
     SleepqLock(this);

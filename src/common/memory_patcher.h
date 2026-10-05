@@ -2,9 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
-#include <cstdint>
 #include <cstring>
-#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -18,6 +16,7 @@ namespace MemoryPatcher {
 
 extern EXPORT uintptr_t g_eboot_address;
 extern uint64_t g_eboot_image_size;
+extern std::string g_eboot_name;
 extern std::string g_game_serial;
 extern std::string patch_file;
 
@@ -26,14 +25,6 @@ enum PatchMask : uint8_t {
     Mask,
     Mask_Jump32,
 };
-
-inline bool IsSpecialCusa() {
-    const std::string_view serial{MemoryPatcher::g_game_serial};
-
-    return serial == "CUSA00035" || serial == "CUSA00785" || serial == "CUSA00076" ||
-           serial == "CUSA00552" || serial == "CUSA00556" || serial == "CUSA00557" ||
-           serial == "CUSA00554";
-}
 
 struct patchInfo {
     std::string gameSerial;
@@ -52,24 +43,10 @@ std::string convertValueToHex(const std::string type, const std::string valueStr
 
 void OnGameLoaded();
 void AddPatchToQueue(const patchInfo& patchToAdd);
-void ApplyRuntimePatch(const std::string& modNameStr, const std::string& offsetStr,
-                       const std::string& valueStr, const std::string& targetStr,
-                       const std::string& sizeStr, bool isOffset, bool littleEndian, int patchMask,
-                       int maskOffset);
+
 void PatchMemory(const patchInfo& patch);
 
 static std::vector<int32_t> PatternToByte(const std::string& pattern);
 uintptr_t PatternScan(const std::string& signature);
-
-struct PendingPatch {
-    std::string modName;
-    std::string address;
-    std::string value;
-    std::string target;
-    std::string size;
-    bool littleEndian = false;
-    PatchMask mask = PatchMask::None;
-    int maskOffset = 0;
-};
 
 } // namespace MemoryPatcher

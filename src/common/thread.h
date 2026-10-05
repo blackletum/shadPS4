@@ -6,8 +6,6 @@
 #pragma once
 
 #include <chrono>
-#include <memory>
-
 #include "common/types.h"
 
 namespace Common {
@@ -19,37 +17,14 @@ enum class ThreadPriority : u32 {
     VeryHigh = 3,
     Critical = 4,
 };
-enum class CpuCoreMode : u32 {
-    All = 0,
-    Efficient = 1,
-    Custom = 2,
-};
-
-class InterruptibleTimer {
-public:
-    InterruptibleTimer();
-    ~InterruptibleTimer();
-
-    InterruptibleTimer(const InterruptibleTimer&) = delete;
-    InterruptibleTimer& operator=(const InterruptibleTimer&) = delete;
-
-    void WaitUntil(std::chrono::steady_clock::time_point deadline);
-    void Notify();
-
-private:
-    struct Impl;
-    std::unique_ptr<Impl> impl;
-};
 
 void SetCurrentThreadRealtime(std::chrono::nanoseconds period_ns);
 
 void SetCurrentThreadPriority(ThreadPriority new_priority);
-void SetThreadPriority(void* thread_handle, ThreadPriority new_priority);
 
 void SetCurrentThreadName(const char* name);
 
 void SetThreadName(void* thread, const char* name);
-void SetThreadAffinity(const std::vector<u32>& core_ids);
 
 bool AccurateSleep(std::chrono::nanoseconds duration, std::chrono::nanoseconds* remaining,
                    bool interruptible);
@@ -69,6 +44,11 @@ public:
 
     std::chrono::nanoseconds GetTotalWait() const {
         return total_wait;
+    }
+
+    /// Counts time spent waiting before Start towards the interval, so Start sleeps that less.
+    void Skip(std::chrono::nanoseconds elapsed) {
+        total_wait -= elapsed;
     }
 };
 

@@ -2,35 +2,38 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cstring>
+#include <fstream>
 #include <iomanip>
-#include <limits>
 #include <sstream>
 #include <vector>
-
-#include "common/io_file.h"
 #include "npbind.h"
 
-bool NPBindFile::Load(const std::filesystem::path& path) {
+bool NPBindFile::Load(const std::string& path) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f)
+        return false;
+
+    std::streamsize sz = f.tellg();
+    if (sz <= 0)
+        return false;
+
+    f.seekg(0, std::ios::beg);
+    std::vector<u8> buf(static_cast<size_t>(sz));
+    if (!f.read(reinterpret_cast<char*>(buf.data()), sz))
+        return false;
+
+    return Load(std::span<const u8>{buf});
+}
+
+bool NPBindFile::Load(std::span<const u8> data) {
     Clear(); // Clear any existing data
 
-    Common::FS::IOFile f(path, Common::FS::FileAccessMode::Read);
-    if (!f.IsOpen())
-        return false;
-
-    const u64 sz = f.GetSize();
-    if (sz == 0 || sz > std::numeric_limits<size_t>::max())
-        return false;
-
-    std::vector<u8> buf(static_cast<size_t>(sz));
-    if (f.ReadRaw<u8>(buf.data(), buf.size()) != buf.size())
-        return false;
-
-    const u64 size = buf.size();
+    const u64 size = data.size();
     if (size < sizeof(NpBindHeader))
         return false;
 
     // Read header
-    memcpy(&m_header, buf.data(), sizeof(NpBindHeader));
+    memcpy(&m_header, data.data(), sizeof(NpBindHeader));
     if (m_header.magic != NPBIND_MAGIC)
         return false;
 
@@ -54,14 +57,14 @@ bool NPBindFile::Load(const std::filesystem::path& path) {
             if (offset + 4 > size)
                 return false;
 
-            memcpy(&e.type, &buf[offset], 2);
-            memcpy(&e.size, &buf[offset + 2], 2);
+            memcpy(&e.type, &data[offset], 2);
+            memcpy(&e.size, &data[offset + 2], 2);
             offset += 4;
 
             if (offset + e.size > size)
                 return false;
 
-            e.data.assign(buf.begin() + offset, buf.begin() + offset + e.size);
+            e.data.assign(data.begin() + offset, data.begin() + offset + e.size);
             offset += e.size;
             return true;
         };
@@ -90,7 +93,7 @@ bool NPBindFile::Load(const std::filesystem::path& path) {
     // Read digest if available
     if (size >= 20) {
         // Digest is typically the last 20 bytes, independent of offset
-        memcpy(m_digest, &buf[size - 20], 20);
+        memcpy(m_digest, &data[size - 20], 20);
     } else {
         memset(m_digest, 0, 20);
     }

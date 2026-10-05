@@ -7,7 +7,6 @@
 
 #include <cmath>
 #include <imgui.h>
-#include "common/types.h"
 
 #include "imgui_internal.h"
 
@@ -16,6 +15,7 @@
 #define IMGUI_FONT_TEXT 0
 #define IMGUI_FONT_MONO 1
 #define IMGUI_FONT_TEXT_BIG 2
+#define IMGUI_FONT_SETTINGS_WINDOW 3
 
 namespace ImGui {
 
@@ -90,6 +90,7 @@ static void DrawCenteredText(const char* text, const char* text_end = nullptr,
     TextEx(text, text_end, ImGuiTextFlags_NoWidthForLargeClippedText);
     PopTextWrapPos();
     SetCursorPos(pos + content);
+    Dummy(ImVec2(0.0f, 0.0f));
 }
 
 // Limited-length InputTextEx wrapper (limits UTF-8 code points)

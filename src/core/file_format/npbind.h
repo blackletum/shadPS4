@@ -3,7 +3,7 @@
 
 #pragma once
 #include <cstdint>
-#include <filesystem>
+#include <span>
 #include <string>
 #include <vector>
 #include "common/endian.h"
@@ -48,7 +48,8 @@ public:
     }
 
     // Load from file
-    bool Load(const std::filesystem::path& path);
+    bool Load(const std::string& path);
+    bool Load(std::span<const u8> data);
 
     // Accessors
     const NpBindHeader& Header() const {

@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+#include <ctime>
 #include "common/logging/log.h"
 #include "common/va_ctx.h"
 #include "core/file_sys/devices/rng_device.h"
@@ -8,7 +10,7 @@
 namespace Core::Devices {
 
 std::shared_ptr<BaseDevice> RngDevice::Create(u32 handle, const char*, s32, u16) {
-    srand(std::time(nullptr));
+    std::srand(std::time(nullptr));
     return std::static_pointer_cast<BaseDevice>(std::make_shared<RngDevice>(handle));
 }
 
@@ -19,7 +21,7 @@ s32 RngDevice::ioctl(u64 cmd, Common::VaCtx* args) {
         auto& data = *vaArgPtr<GetRandomArgs>(&args->va_list);
         data.result = 0;
         for (u64 i = 0; i < 64; i++) {
-            data.buf[i] = rand();
+            data.buf[i] = std::rand();
         }
     } else {
         // ENOIOCTL

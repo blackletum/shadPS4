@@ -7,6 +7,7 @@
 #include <map>
 #include <common/path_util.h>
 #include <common/scm_rev.h>
+#include "common/assert.h"
 #include "common/logging/log.h"
 #include "user_settings.h"
 
@@ -19,10 +20,7 @@ std::mutex UserSettingsImpl::s_mutex;
 // Singleton
 UserSettingsImpl::UserSettingsImpl() = default;
 
-UserSettingsImpl::~UserSettingsImpl() {
-    if (m_loaded)
-        Save();
-}
+UserSettingsImpl::~UserSettingsImpl() {}
 
 std::shared_ptr<UserSettingsImpl> UserSettingsImpl::GetInstance() {
     std::lock_guard lock(s_mutex);
@@ -74,10 +72,8 @@ bool UserSettingsImpl::Load() {
     const auto path = Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "users.json";
     try {
         if (!std::filesystem::exists(path)) {
-            LOG_DEBUG(Config, "User settings file not found: {}", path.string());
             if (m_userManager.GetUsers().user.empty())
                 m_userManager.GetUsers() = m_userManager.CreateDefaultUsers();
-            m_loaded = true;
             Save();
             return false;
         }
@@ -103,15 +99,12 @@ bool UserSettingsImpl::Load() {
             m_userManager.GetUsers() = default_users;
         }
 
-        LOG_DEBUG(Config, "User settings loaded successfully");
-
-        m_loaded = true;
         if (m_userManager.GetUsers().commit_hash != Common::g_scm_rev)
             Save();
 
         return true;
     } catch (const std::exception& e) {
-        LOG_ERROR(Config, "Error loading user settings: {}", e.what());
+        UNREACHABLE_MSG("Error loading user settings: {}", e.what());
         if (m_userManager.GetUsers().user.empty())
             m_userManager.GetUsers() = m_userManager.CreateDefaultUsers();
         return false;

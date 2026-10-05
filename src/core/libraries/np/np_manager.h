@@ -20,7 +20,7 @@ constexpr s32 ORBIS_NP_MANAGER_REQUEST_LIMIT = 0x20;
 constexpr s32 ORBIS_NP_MANAGER_REQUEST_ID_OFFSET = 0x20000000;
 
 enum class OrbisNpState : u32 {
-    Unknown = 0,
+    NotSignedUp = 0,
     SignedOut = 1,
     SignedIn = 2,
 };
@@ -51,6 +51,20 @@ struct OrbisNpCountryCode {
     char country_code[2];
     char end;
     char pad;
+};
+
+struct OrbisNpAgeRestriction {
+    OrbisNpCountryCode country_code;
+    s8 age;
+    u8 padding[3];
+};
+
+struct OrbisNpContentRestriction {
+    u64 size;
+    s8 default_age_restriction;
+    u8 padding[3];
+    s32 age_restriction_count;
+    const OrbisNpAgeRestriction* age_restriction;
 };
 
 struct OrbisNpDate {
@@ -92,6 +106,8 @@ struct OrbisNpCreateAsyncRequestParameter {
 
 void RegisterNpCallback(std::string key, std::function<void()> cb);
 void DeregisterNpCallback(std::string key);
+void NotifyNpStateFromUserServiceEvent(Libraries::UserService::OrbisUserServiceEventType event_type,
+                                       Libraries::UserService::OrbisUserServiceUserId user_id);
 
 s32 PS4_SYSV_ABI sceNpGetNpId(Libraries::UserService::OrbisUserServiceUserId user_id,
                               OrbisNpId* np_id);

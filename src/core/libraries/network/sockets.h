@@ -66,6 +66,7 @@ struct Socket {
     virtual ~Socket() = default;
     virtual bool IsValid() const = 0;
     virtual int Close() = 0;
+    virtual int Shutdown(int how) = 0;
     virtual int SetSocketOptions(int level, int optname, const void* optval, u32 optlen) = 0;
     virtual int GetSocketOptions(int level, int optname, void* optval, u32* optlen) = 0;
     virtual int Bind(const OrbisNetSockaddr* addr, u32 addrlen) = 0;
@@ -82,9 +83,6 @@ struct Socket {
     virtual int GetPeerName(OrbisNetSockaddr* addr, u32* namelen) = 0;
     virtual int fstat(Libraries::Kernel::OrbisKernelStat* stat) = 0;
     virtual std::optional<net_socket> Native() = 0;
-    virtual bool HasQueuedData() {
-        return false;
-    }
     std::mutex m_mutex;
     std::mutex receive_mutex;
     int socket_type;
@@ -109,6 +107,7 @@ struct PosixSocket : public Socket {
     explicit PosixSocket(net_socket sock) : Socket(0, 0, 0), sock(sock) {}
     bool IsValid() const override;
     int Close() override;
+    int Shutdown(int how) override;
     int SetSocketOptions(int level, int optname, const void* optval, u32 optlen) override;
     int GetSocketOptions(int level, int optname, void* optval, u32* optlen) override;
     int Bind(const OrbisNetSockaddr* addr, u32 addrlen) override;
@@ -129,13 +128,12 @@ struct PosixSocket : public Socket {
 };
 
 struct P2PSocket : public Socket {
-    net_socket sock_;        // reference to shared transport fd (NOT owned)
-    u16 bound_vport_{0};     // bound virtual port (network byte order)
-    int sockopt_so_nbio_{0}; // non-blocking mode flag
-
-    explicit P2PSocket(int domain, int type, int protocol);
-    bool IsValid() const override;
+    explicit P2PSocket(int domain, int type, int protocol) : Socket(domain, type, protocol) {}
+    bool IsValid() const override {
+        return true;
+    }
     int Close() override;
+    int Shutdown(int how) override;
     int SetSocketOptions(int level, int optname, const void* optval, u32 optlen) override;
     int GetSocketOptions(int level, int optname, void* optval, u32* optlen) override;
     int Bind(const OrbisNetSockaddr* addr, u32 addrlen) override;
@@ -150,17 +148,10 @@ struct P2PSocket : public Socket {
     int GetSocketAddress(OrbisNetSockaddr* name, u32* namelen) override;
     int GetPeerName(OrbisNetSockaddr* addr, u32* namelen) override;
     int fstat(Libraries::Kernel::OrbisKernelStat* stat) override;
-    bool HasQueuedData() override;
     std::optional<net_socket> Native() override {
-        if (IsValid())
-            return sock_;
         return {};
     }
 };
-
-// Drain the shared P2P transport socket into per-vport queues.
-// Call this before checking HasQueuedData() on P2P sockets.
-void DrainP2PTransport();
 
 struct UnixSocket : public Socket {
     net_socket sock;
@@ -172,6 +163,7 @@ struct UnixSocket : public Socket {
     explicit UnixSocket(net_socket sock) : Socket(0, 0, 0), sock(sock) {}
     bool IsValid() const override;
     int Close() override;
+    int Shutdown(int how) override;
     int SetSocketOptions(int level, int optname, const void* optval, u32 optlen) override;
     int GetSocketOptions(int level, int optname, void* optval, u32* optlen) override;
     int Bind(const OrbisNetSockaddr* addr, u32 addrlen) override;
@@ -190,5 +182,16 @@ struct UnixSocket : public Socket {
         return sock;
     }
 };
+
+u16 GetP2PConfiguredPort();
+u32 GetP2PAdvertisedAddr();
+bool EnsureP2PTransport();
+bool P2PTransportIsReady();
+int P2PSignalingSendTo(const void* data, u32 len, u32 dest_addr, u16 dest_port);
+int P2PSignalingRecvFrom(void* buf, u32 len, u32* from_addr, u16* from_port);
+int P2PControlSendTo(const void* data, u32 len, u32 dest_addr, u16 dest_port);
+int P2PControlRecvFrom(void* buf, u32 len, u32* from_addr, u16* from_port);
+int P2PMatching2SendTo(const void* data, u32 len, u32 dest_addr, u16 dest_port);
+int P2PMatching2RecvFrom(void* buf, u32 len, u32* from_addr, u16* from_port);
 
 } // namespace Libraries::Net

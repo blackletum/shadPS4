@@ -44,16 +44,19 @@ enum class DataFormat : u32 {
     FormatBc5 = 39,
     FormatBc6 = 40,
     FormatBc7 = 41,
-    FormatFmask8_1 = 47,
-    FormatFmask8_2 = 48,
-    FormatFmask8_4 = 49,
-    FormatFmask16_1 = 50,
-    FormatFmask16_2 = 51,
-    FormatFmask32_2 = 52,
-    FormatFmask32_4 = 53,
-    FormatFmask32_8 = 54,
-    FormatFmask64_4 = 55,
-    FormatFmask64_8 = 56,
+    FormatFmask8_S2_F1 = 44,
+    FormatFmask8_S4_F1 = 45,
+    FormatFmask8_S8_F1 = 46,
+    FormatFmask8_S2_F2 = 47,
+    FormatFmask8_S4_F2 = 48,
+    FormatFmask8_S4_F4 = 49,
+    FormatFmask16_S16_F1 = 50,
+    FormatFmask16_S8_F2 = 51,
+    FormatFmask32_S16_F2 = 52,
+    FormatFmask32_S8_F4 = 53,
+    FormatFmask32_S8_F8 = 54,
+    FormatFmask64_S16_F4 = 55,
+    FormatFmask64_S16_F8 = 56,
     Format4_4 = 57,
     Format6_5_5 = 58,
     Format1 = 59,
@@ -62,6 +65,7 @@ enum class DataFormat : u32 {
     Format32_As_8_8 = 62,
     Format32_As_32_32_32_32 = 63,
 };
+constexpr u32 NUM_DATA_FMTS = static_cast<u32>(DataFormat::Format32_As_32_32_32_32) + 1;
 
 enum class NumberFormat : u32 {
     Unorm = 0,
@@ -78,6 +82,7 @@ enum class NumberFormat : u32 {
     Ubint = 12,
     Ubscaled = 13,
 };
+constexpr u32 NUM_NUMBER_FMTS = static_cast<u32>(NumberFormat::Ubscaled) + 1;
 
 enum class NumberClass : u8 {
     Float = 0,
@@ -353,7 +358,7 @@ constexpr NumberConversion MapNumberConversion(const NumberFormat num_fmt,
         case DataFormat::Format16_16_16_16:
             return NumberConversion::Sint16ToSnormNz;
         default:
-            return NumberConversion::None;
+            UNREACHABLE_MSG("data_fmt = {}", u32(data_fmt));
         }
     }
     default:
@@ -386,15 +391,32 @@ constexpr bool IsBlockCoded(DataFormat format) {
 }
 
 constexpr bool IsFmask(DataFormat format) {
-    return format >= DataFormat::FormatFmask8_1 && format <= DataFormat::FormatFmask64_8;
+    return format >= DataFormat::FormatFmask8_S2_F1 && format <= DataFormat::FormatFmask64_S16_F8;
 }
 
 std::string_view NameOf(DataFormat fmt);
 std::string_view NameOf(NumberFormat fmt);
 
-u32 NumComponents(DataFormat format);
-u32 NumBitsPerBlock(DataFormat format);
-u32 NumBitsPerElement(DataFormat format);
+constexpr u32 NUM_ENTRIES = 42;
+
+extern const std::array<s32, NUM_ENTRIES> NUM_COMPONENTS;
+extern const std::array<s32, NUM_ENTRIES> BITS_PER_BLOCK;
+extern const std::array<s32, NUM_ENTRIES> BITS_PER_ELEMENT;
+
+constexpr u32 NumComponents(DataFormat format) noexcept {
+    const u32 index = static_cast<u32>(format);
+    return NUM_COMPONENTS[index];
+}
+
+constexpr u32 NumBitsPerBlock(DataFormat format) noexcept {
+    const u32 index = static_cast<u32>(format);
+    return BITS_PER_BLOCK[index];
+}
+
+constexpr u32 NumBitsPerElement(DataFormat format) noexcept {
+    const u32 index = static_cast<u32>(format);
+    return BITS_PER_ELEMENT[index];
+}
 
 } // namespace AmdGpu
 

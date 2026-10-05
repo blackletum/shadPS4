@@ -1,14 +1,13 @@
-//  SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+//  SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 //  SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/assert.h"
-#include "common/config.h"
-#include "video_core/host_shaders/fsr_comp.h"
+#include "core/emulator_settings.h"
+#include "video_core/host_shaders/fsr_easu_comp.h"
+#include "video_core/host_shaders/fsr_rcas_comp.h"
 #include "video_core/renderer_vulkan/host_passes/fsr_pass.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 #include "video_core/renderer_vulkan/vk_shader_util.h"
-
-#include <vk_mem_alloc.h>
 
 #define A_CPU
 #include "core/debug_state.h"
@@ -78,19 +77,11 @@ void FsrPass::Create(vk::Device device, VmaAllocator allocator, u32 num_images) 
         .size = sizeof(FSRConstants),
     };
 
-    const auto& cs_easu_module =
-        Compile(HostShaders::FSR_COMP, vk::ShaderStageFlagBits::eCompute, device,
-                {
-                    "SAMPLE_EASU=1",
-                });
+    const auto& cs_easu_module = CompileSPV(FSR_EASU_COMP, device);
     ASSERT(cs_easu_module);
     SetObjectName(device, cs_easu_module, "fsr.comp [EASU]");
 
-    const auto& cs_rcas_module =
-        Compile(HostShaders::FSR_COMP, vk::ShaderStageFlagBits::eCompute, device,
-                {
-                    "SAMPLE_RCAS=1",
-                });
+    const auto& cs_rcas_module = CompileSPV(FSR_RCAS_COMP, device);
     ASSERT(cs_rcas_module);
     SetObjectName(device, cs_rcas_module, "fsr.comp [RCAS]");
 
@@ -166,7 +157,7 @@ vk::ImageView FsrPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
         CreateImages(img);
     }
 
-    if (Config::getVkHostMarkersEnabled()) {
+    if (EmulatorSettings.IsVkHostMarkersEnabled()) {
         cmdbuf.beginDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{
             .pLabelName = "Host/FSR",
         });
@@ -281,7 +272,7 @@ vk::ImageView FsrPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
 
         { // rcas
             consts = {};
-            FsrRcasCon(reinterpret_cast<AU1*>(&consts.Const0), Config::getRcasAttenuation());
+            FsrRcasCon(reinterpret_cast<AU1*>(&consts.Const0), settings.rcas_attenuation);
             consts.Sample[0] = hdr ? 1 : 0;
 
             std::array<vk::DescriptorImageInfo, 3> img_info{{
@@ -389,7 +380,7 @@ vk::ImageView FsrPass::Render(vk::CommandBuffer cmdbuf, vk::ImageView input,
         .pImageMemoryBarriers = return_barrier.data(),
     });
 
-    if (Config::getVkHostMarkersEnabled()) {
+    if (EmulatorSettings.IsVkHostMarkersEnabled()) {
         cmdbuf.endDebugUtilsLabelEXT();
     }
 

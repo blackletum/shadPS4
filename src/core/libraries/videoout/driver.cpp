@@ -2,12 +2,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/assert.h"
-#include "common/config.h"
 #include "common/debug.h"
+#include "common/perf_profiler.h"
 #include "common/thread.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
-#include "core/file_sys/storage_scheduler.h"
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/videoout/driver.h"
 #include "core/libraries/videoout/videoout_error.h"
@@ -240,7 +239,11 @@ void VideoOutDriver::Flip(const Request& req) {
     presenter->SetHDR(req.port->is_hdr);
 
     // Present the frame.
-    presenter->Present(req.frame);
+    {
+        Common::Perf::ScopedStall stall{Common::Perf::Stall::Present};
+        presenter->Present(req.frame);
+    }
+    Common::Perf::OnFlip();
 
     // Update flip status.
     auto* port = req.port;
@@ -277,20 +280,11 @@ void VideoOutDriver::Flip(const Request& req) {
     }
     // save to prev buf index
     port->prev_index = req.index;
-
-    // Real guest flips (never DrawLastFrame re-presents) feed the app0 storage scheduler so
-    // modeled I/O stretches when the emulator runs below the game's target flip cadence.
-    auto& storage = Core::FileSys::GetApp0StorageScheduler();
-    if (storage.IsEnabled()) {
-        const auto expected_period =
-            std::chrono::nanoseconds{1'000'000'000 / Config::vblankFreq()} * (port->flip_rate + 1);
-        storage.ReportGuestFlip(expected_period);
-    }
 }
 
 void VideoOutDriver::DrawBlankFrame() {
-    const auto empty_frame = presenter->PrepareBlankFrame(false);
-    presenter->Present(empty_frame);
+    const auto empty_frame = presenter->PrepareBlankFrame(true);
+    presenter->Present(empty_frame, false, false);
 }
 
 void VideoOutDriver::DrawLastFrame() {
@@ -337,61 +331,39 @@ void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_
         frame = presenter->PrepareFrame(group, buffer.address_left);
     }
 
-    std::scoped_lock lock{mutex};
-    requests.push({
-        .frame = frame,
-        .port = port,
-        .flip_arg = flip_arg,
-        .index = index,
-        .eop = is_eop,
-    });
+    {
+        std::scoped_lock lock{mutex};
+        requests.push({
+            .frame = frame,
+            .port = port,
+            .flip_arg = flip_arg,
+            .index = index,
+            .eop = is_eop,
+        });
+    }
+    request_cv.notify_one();
 }
 
 void VideoOutDriver::PresentThread(std::stop_token token) {
-    // Use 64-bit integers for nanosecond arithmetic to avoid overflow/truncation.
-    int64_t fps_cap_value_ns = 0;
-    constexpr int64_t kNanosPerSec = 1'000'000'000LL;
-
-    if (Config::isFpsLimiterEnabled()) {
-        const auto fps_limit = static_cast<int64_t>(Config::getFpsLimit());
-        LOG_INFO(Lib_VideoOut, "PresentThread: FPS limiter enabled, fps_limit = {}", fps_limit);
-        if (fps_limit > 0) {
-            fps_cap_value_ns = kNanosPerSec / fps_limit; // nanoseconds per frame
-        } else {
-            // If fps_limit is 0 (invalid), fall back to vblank frequency below.
-            LOG_INFO(Lib_VideoOut,
-                     "PresentThread: FPS limiter has invalid value (0), falling back to vblank");
-            fps_cap_value_ns = 0;
-        }
-    } else {
-        LOG_INFO(Lib_VideoOut, "PresentThread: FPS limiter disabled, using vblank frequency");
-    }
-
-    if (fps_cap_value_ns == 0) {
-        // Either limiter disabled or limiter produced 0 (or invalid fps). Use vblank frequency.
-        const auto vblank_freq = static_cast<int64_t>(Config::vblankFreq());
-        LOG_INFO(Lib_VideoOut, "PresentThread: Using vblank_freq = {}", vblank_freq);
-        if (vblank_freq > 0) {
-            fps_cap_value_ns = kNanosPerSec / vblank_freq; // nanoseconds per vblank
-        } else {
-            // As a last resort: clamp to 1ms per frame (1000000 ns) to avoid zero-duration.
-            fps_cap_value_ns = 1'000'000LL;
-        }
-    }
-
-    LOG_INFO(Lib_VideoOut, "PresentThread: fps_cap_value_ns = {} ns ({} FPS)", fps_cap_value_ns,
-             fps_cap_value_ns > 0 ? 1'000'000'000LL / fps_cap_value_ns : 0);
-
-    // Ensure at least 1 ns to avoid zero-duration timers.
-    if (fps_cap_value_ns <= 0) {
-        fps_cap_value_ns = 1;
-    }
-
-    const std::chrono::nanoseconds FpsCap{static_cast<long long>(fps_cap_value_ns)};
+    const std::chrono::nanoseconds vblank_period(1000000000 /
+                                                 EmulatorSettings.GetVblankFrequency());
 
     Common::SetCurrentThreadName("shadPS4:PresentThread");
-    Common::SetCurrentThreadRealtime(FpsCap);
-    Common::AccurateTimer timer{FpsCap};
+    Common::SetCurrentThreadRealtime(vblank_period);
+
+    Common::AccurateTimer timer{vblank_period};
+
+    // A frame that misses its vblank is shown as soon as a whole vblank period has passed since
+    // the last flip, rather than held for the next vblank. Holding it made a frame that took a
+    // little over a period show for two, so frames alternated between 16 and 33 ms, and the GPU
+    // thread sat waiting for the game's next buffer to be released for up to a tenth of the time.
+    // Vblanks themselves keep their pace, and frames are still shown at most once per period.
+    // Waits on the condition variable are only accurate to about a millisecond, so this stops
+    // a little before each vblank to keep it on time.
+    constexpr auto EarlyFlipMargin = std::chrono::milliseconds{2};
+    // A frame shown early is shown for at least this long before a vblank flips the next one.
+    const auto min_flip_interval = vblank_period * 3 / 4;
+    auto last_flip = std::chrono::steady_clock::now();
 
     const auto receive_request = [this] -> Request {
         std::scoped_lock lk{mutex};
@@ -403,7 +375,38 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
         return {};
     };
 
+    const auto flip_late_frames = [&] {
+        const auto wait_start = std::chrono::steady_clock::now();
+        const auto wait_end = wait_start + timer.GetTotalWait() - EarlyFlipMargin;
+        std::unique_lock lk{mutex};
+        while (main_port.flip_rate == 0 && !DebugState.IsGuestThreadsPaused()) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= wait_end) {
+                break;
+            }
+            if (requests.empty()) {
+                request_cv.wait_until(lk, wait_end);
+                continue;
+            }
+            const auto due = last_flip + vblank_period;
+            if (now < due) {
+                request_cv.wait_until(lk, std::min(due, wait_end));
+                continue;
+            }
+            const auto request = requests.front();
+            requests.pop();
+            lk.unlock();
+            Flip(request);
+            FRAME_END;
+            last_flip = std::chrono::steady_clock::now();
+            lk.lock();
+        }
+        lk.unlock();
+        timer.Skip(std::chrono::steady_clock::now() - wait_start);
+    };
+
     while (!token.stop_requested()) {
+        flip_late_frames();
         timer.Start();
 
         if (DebugState.IsGuestThreadsPaused()) {
@@ -414,31 +417,12 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
 
         // Check if it's time to take a request.
         auto& vblank_status = main_port.vblank_status;
-
-        // Use wide unsigned arithmetic to avoid wrap when adding 1.
-        const uint64_t flip_rate_plus_one = static_cast<uint64_t>(main_port.flip_rate) + 1ULL;
-        if (flip_rate_plus_one > 0) {
-            if ((static_cast<uint64_t>(vblank_status.count) % flip_rate_plus_one) == 0ULL) {
-                const auto request = receive_request();
-                if (!request) {
-                    if (timer.GetTotalWait().count() < 0) { // Don't draw too fast
-                        if (!main_port.is_open) {
-                            DrawBlankFrame();
-                        } else if (ImGui::Core::MustKeepDrawing()) {
-                            DrawLastFrame();
-                        }
-                    }
-                } else {
-                    Flip(request);
-                    FRAME_END;
-                }
-            }
-        } else {
-            // Defensive fallback if flip_rate_plus_one somehow became zero (shouldn't happen),
-            // treat as always true.
-            const auto request = receive_request();
+        if (vblank_status.count % (main_port.flip_rate + 1) == 0) {
+            const bool flipped_recently =
+                std::chrono::steady_clock::now() - last_flip < min_flip_interval;
+            const auto request = flipped_recently ? Request{} : receive_request();
             if (!request) {
-                if (timer.GetTotalWait().count() < 0) {
+                if (timer.GetTotalWait().count() < 0) { // Dont draw too fast
                     if (!main_port.is_open) {
                         DrawBlankFrame();
                     } else if (ImGui::Core::MustKeepDrawing()) {
@@ -448,6 +432,7 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
             } else {
                 Flip(request);
                 FRAME_END;
+                last_flip = std::chrono::steady_clock::now();
             }
         }
 
@@ -470,11 +455,8 @@ void VideoOutDriver::PresentThread(std::stop_token token) {
 
             // Update vblank status
             vblank_status.count++;
-            if (main_port.flip_rate == 0 ||
-                (vblank_status.count - 1) % (main_port.flip_rate + 1) == 0) {
-                vblank_status.process_time = Libraries::Kernel::sceKernelGetProcessTime();
-                vblank_status.tsc = Libraries::Kernel::sceKernelReadTsc();
-            }
+            vblank_status.process_time = Libraries::Kernel::sceKernelGetProcessTime();
+            vblank_status.tsc = Libraries::Kernel::sceKernelReadTsc();
             main_port.vblank_cv.notify_all();
         }
 

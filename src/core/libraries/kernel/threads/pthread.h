@@ -14,6 +14,7 @@
 #include "common/shared_first_mutex.h"
 #include "core/libraries/kernel/sync/mutex.h"
 #include "core/libraries/kernel/sync/semaphore.h"
+#include "core/libraries/kernel/threads/exception.h"
 #include "core/libraries/kernel/time.h"
 #include "core/thread.h"
 #include "core/tls.h"
@@ -275,13 +276,8 @@ struct Pthread {
     static constexpr u32 ThrMagic = 0xd09ba115U;
     static constexpr u32 MaxDeferWaiters = 50;
 
-    struct DeferredWakeEntry {
-        Pthread* thread;
-        u64 wait_generation;
-    };
-
     std::atomic<s32> tid;
-    std::mutex lock;
+    std::unique_ptr<std::mutex> lock = std::make_unique<std::mutex>();
     u32 cycle;
     std::atomic_int locklevel;
     std::atomic_int critical_count;
@@ -289,7 +285,7 @@ struct Pthread {
     int refcount;
     PthreadEntryFunc start_routine;
     void* arg;
-    Core::NativeThread native_thr;
+    std::unique_ptr<Core::NativeThread> native_thr;
     PthreadAttr attr;
     std::atomic_bool cancel_enable;
     std::atomic_bool cancel_pending;
@@ -299,7 +295,7 @@ struct Pthread {
     std::atomic_bool cancelling;
     u64 sigmask;
     bool unblock_sigcancel;
-    bool in_sigsuspend;
+    std::atomic_bool in_sigsuspend{};
     bool force_exit;
     PthreadState state;
     int error;
@@ -307,6 +303,7 @@ struct Pthread {
     ThreadFlags flags;
     ThreadListFlags tlflags;
     void* ret;
+    u8 pad0[272];
     PthreadSpecificElem* specific;
     int specific_data_count;
     int rdlock_count;
@@ -329,9 +326,29 @@ struct Pthread {
     Pthread* join_target{};
     std::mutex join_wait_mutex;
     std::condition_variable join_wait_cv;
-    std::atomic<u64> cond_wait_generation{0};
-    std::atomic<u64> cond_wait_armed_generation{0};
-    std::atomic<u64> last_cond_wake_generation{0};
+
+    std::array<std::atomic<u32>, 128> pending_signal_counts{};
+    std::array<std::atomic<u32>, 4> guest_sigmask{};
+
+    WakeSemaphore signal_sema{0};
+    std::atomic_bool in_sigwait{};
+    // std::atomic_bool in_sigsuspend{};
+    std::atomic_bool sigsuspend_interrupted{};
+    Sigset sigwait_set{};
+    OrbisKernelExceptionHandlerStack sigaltstack{};
+
+    bool IsSignalBlocked(s32 sig) const;
+    void QueueSignal(s32 sig);
+    bool ConsumeSignal(s32 sig);
+    s32 FindPendingSignal(const Sigset& set) const;
+    s32 FindPendingUnblockedSignal() const;
+    bool HasPendingSignal() const;
+    bool HasDeliverableSignal() const;
+    void WakeForSignal();
+    bool DispatchSignal(s32 sig, Siginfo* info, Ucontext* context);
+    bool DispatchPendingSignals(Siginfo* info, Ucontext* context);
+    void GetGuestSigmask(Sigset& mask);
+    void SetGuestSigmask(Sigset const& mask);
 
     bool InCritical() const noexcept {
         return locklevel.load(std::memory_order_acquire) > 0 ||
@@ -344,34 +361,6 @@ struct Pthread {
 
     bool ShouldCancel() const noexcept {
         return cancel_pending && cancel_enable && no_cancel == 0;
-    }
-
-    u64 BeginCondWaitGeneration() noexcept {
-        return cond_wait_generation.fetch_add(1, std::memory_order_relaxed) + 1;
-    }
-
-    u64 GetCondWaitGeneration() const noexcept {
-        return cond_wait_generation.load(std::memory_order_relaxed);
-    }
-
-    void ArmCondWaitGeneration(const u64 generation) noexcept {
-        cond_wait_armed_generation.store(generation, std::memory_order_relaxed);
-    }
-
-    u64 GetCondWaitArmedGeneration() const noexcept {
-        return cond_wait_armed_generation.load(std::memory_order_relaxed);
-    }
-
-    void ClearCondWaitGenerationArm() noexcept {
-        cond_wait_armed_generation.store(0, std::memory_order_relaxed);
-    }
-
-    void SetLastCondWakeGeneration(const u64 generation) noexcept {
-        last_cond_wake_generation.store(generation, std::memory_order_relaxed);
-    }
-
-    u64 GetLastCondWakeGeneration() const noexcept {
-        return last_cond_wake_generation.load(std::memory_order_relaxed);
     }
 
     void WakeAll() {
@@ -438,6 +427,9 @@ struct Pthread {
 
     int SetAffinity(const Cpuset* cpuset);
 };
+// fym static assertion expression is not an integral constant expression
+// static_assert(offsetof(Pthread, specific) == 0x1c8);
+
 using PthreadT = Pthread*;
 
 extern thread_local Pthread* g_curthread;

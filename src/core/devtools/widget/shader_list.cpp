@@ -1,4 +1,4 @@
-//  SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+//  SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 //  SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <fstream>
@@ -8,11 +8,11 @@
 #include <imgui.h>
 
 #include "common.h"
-#include "common/config.h"
 #include "common/path_util.h"
 #include "common/string_util.h"
 #include "core/debug_state.h"
 #include "core/devtools/options.h"
+#include "core/emulator_settings.h"
 #include "imgui/imgui_std.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
@@ -179,13 +179,13 @@ bool ShaderList::Selection::DrawShader(DebugStateType::ShaderDump& value) {
             DebugState.ShowDebugMessage(msg);
         }
         if (compile) {
-            static std::map<Shader::LogicalStage, std::string> stage_arg = {
-                {Shader::LogicalStage::Vertex, "vert"},
-                {Shader::LogicalStage::TessellationControl, "tesc"},
-                {Shader::LogicalStage::TessellationEval, "tese"},
-                {Shader::LogicalStage::Geometry, "geom"},
-                {Shader::LogicalStage::Fragment, "frag"},
-                {Shader::LogicalStage::Compute, "comp"},
+            static std::map<Shader::SwStage, std::string> stage_arg = {
+                {Shader::SwStage::Vertex, "vert"},
+                {Shader::SwStage::TessellationControl, "tesc"},
+                {Shader::SwStage::TessellationEval, "tese"},
+                {Shader::SwStage::Geometry, "geom"},
+                {Shader::SwStage::Fragment, "frag"},
+                {Shader::SwStage::Compute, "comp"},
             };
             auto stage = stage_arg.find(value.l_stage);
             if (stage == stage_arg.end()) {
@@ -244,8 +244,8 @@ void ShaderList::Draw() {
         return;
     }
 
-    if (!Config::collectShadersForDebug()) {
-        DrawCenteredText("Enable 'CollectShader' in config to see shaders");
+    if (!EmulatorSettings.IsShaderCollect()) {
+        DrawCenteredText("Enable 'shader_collect' in config to see shaders");
         End();
         return;
     }

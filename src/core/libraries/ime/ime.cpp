@@ -16,8 +16,8 @@
 namespace Libraries::Ime {
 
 static std::queue<OrbisImeEvent> g_ime_events;
-static std::optional<ImeState> g_ime_state;
-static ImeUi g_ime_ui;
+static std::unique_ptr<ImeState> g_ime_state;
+static std::unique_ptr<ImeUi> g_ime_ui;
 
 namespace {
 
@@ -217,8 +217,8 @@ public:
         }*/
 
         if (ime_mode) {
-            g_ime_state = ImeState(&m_param.ime, &m_param.ime_ext);
-            g_ime_ui = ImeUi(&*g_ime_state, &m_param.ime, &m_param.ime_ext);
+            g_ime_state = std::make_unique<ImeState>(&m_param.ime, &m_param.ime_ext);
+            g_ime_ui = std::make_unique<ImeUi>(g_ime_state.get(), &m_param.ime, &m_param.ime_ext);
 
             // Queue the Open event so it is delivered on next sceImeUpdate
             LOG_DEBUG(Lib_Ime, "IME Event queued: Open rect x={}, y={}, w={}, h={}",
@@ -252,18 +252,20 @@ public:
     void Execute(OrbisImeEventHandler handler, OrbisImeEvent* event, bool use_param_handler) {
         if (m_ime_mode) {
             OrbisImeParam param = m_param.ime;
-            if (use_param_handler) {
-                param.handler(param.arg, event);
-            } else {
-                handler(param.arg, event);
+            const OrbisImeEventHandler callback = use_param_handler ? param.handler : handler;
+            if (!callback) {
+                LOG_ERROR(Lib_Ime, "ImeHandler::Execute called with null IME callback");
+                return;
             }
+            callback(param.arg, event);
         } else {
             OrbisImeKeyboardParam param = m_param.key;
-            if (use_param_handler) {
-                param.handler(param.arg, event);
-            } else {
-                handler(param.arg, event);
+            const OrbisImeEventHandler callback = use_param_handler ? param.handler : handler;
+            if (!callback) {
+                LOG_ERROR(Lib_Ime, "ImeHandler::Execute called with null keyboard callback");
+                return;
             }
+            callback(param.arg, event);
         }
     }
 
@@ -366,8 +368,8 @@ Error PS4_SYSV_ABI sceImeClose() {
         LOG_ERROR(Lib_Ime, "Failed to close IME handler, it is still open");
         return Error::INTERNAL;
     }
-    g_ime_ui = ImeUi();
-    g_ime_state = ImeState();
+    g_ime_ui = std::make_unique<ImeUi>();
+    g_ime_state = std::make_unique<ImeState>();
 
     LOG_DEBUG(Lib_Ime, "IME closed successfully");
     return Error::OK;
